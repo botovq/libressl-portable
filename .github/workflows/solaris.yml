@@ -24,7 +24,7 @@ jobs:
       - name: "Setup"
         run: |
           sudo apt-get update
-          sudo apt-get install -y automake autoconf libtool
+          sudo apt-get install -y automake autoconf libtool gdb
           ./autogen.sh
 
       - name: "Build on VM"
@@ -34,4 +34,5 @@ jobs:
             pkg install gcc make
           run: |
             MAKE=gmake ./configure
-            gmake -j2 check || (cat tests/test-suite.log && exit 1)
+            coreadm -p $HOME/%f.%p
+            gmake -j2 check || (gdb -batch -ex bt tests/whirlpool_test $HOME/whirlpool*; exit 1)
