@@ -35,4 +35,4 @@ jobs:
           run: |
             MAKE=gmake ./configure
             coreadm -p $HOME/%f.%p
-            gmake -j2 check || (gdb -batch -ex bt tests/whirlpool_test $HOME/whirlpool*; exit 1)
+            gmake -j2 check || (ls $HOME/wh*; echo where | dbx tests/whirlpool_test $HOME/whirlpool*; exit 1)
