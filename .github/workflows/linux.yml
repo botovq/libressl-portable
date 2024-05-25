@@ -38,8 +38,7 @@ jobs:
 
       - name: "Run tests"
         run: |
-          ./scripts/test
-          [ -f ./tests/test-suite.log ] && cat ./tests/test-suite.log
+          ./scripts/test || { cat ./tests/test-suite.log; false }
         env:
           ARCH: "${{ matrix.arch }}"
           CC: "${{ matrix.compiler }}"
