@@ -587,6 +587,7 @@ add_test(rfc3779 rfc3779)
 # rfc5280time
 add_executable(rfc5280time rfc5280time.c)
 target_link_libraries(rfc5280time ${OPENSSL_TEST_LIBS})
+add_test(rfc5280time rfc5280time)
 if(SMALL_TIME_T)
 	set_property(TEST rfc5280time PROPERTY WILL_FAIL TRUE)
 endif()
