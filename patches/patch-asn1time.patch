@@ -1,0 +1,23 @@
+Attempt to trigger a test failure on linux/arm32
+
+--- tests/asn1time.c.orig	Sat May 25 16:22:36 2024
++++ tests/asn1time.c	Sat May 25 16:22:43 2024
+@@ -121,6 +121,18 @@ static const struct asn1_time_test asn1_gentime_tests[
+ 			0x5a,
+ 		},
+ 	},
++	{
++		/* 1 second after the epoch wraps. */
++		.str = "20380119031408Z",
++		.data = "20380119031408Z",
++		.time = 2147483648LL,
++		.der = {
++			0x18, 0x0f, 0x32, 0x30, 0x33, 0x38, 0x30, 0x31,
++			0x31, 0x39, 0x30, 0x33, 0x31, 0x34, 0x30, 0x38,
++			0x5a,
++		},
++
++	},
+ };
+ 
+ static const struct asn1_time_test asn1_utctime_tests[] = {
