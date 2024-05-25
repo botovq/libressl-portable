@@ -102,7 +102,7 @@ add_executable(asn1time asn1time.c)
 target_link_libraries(asn1time ${OPENSSL_TEST_LIBS})
 add_test(asn1time asn1time)
 if(SMALL_TIME_T)
-	set_property(TEST rfc5280time PROPERTY WILL_FAIL TRUE)
+	set_property(TEST asn1time PROPERTY WILL_FAIL TRUE)
 endif()
 
 # asn1x509
