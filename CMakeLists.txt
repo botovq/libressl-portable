@@ -323,6 +323,31 @@ if(HAVE_MEMMEM)
 	add_definitions(-DHAVE_MEMMEM)
 endif()
 
+check_function_exists(accept4 HAVE_ACCEPT4)
+if(HAVE_ACCEPT4)
+	add_definitions(-DHAVE_ACCEPT4)
+endif()
+
+check_function_exists(pipe2 HAVE_PIPE2)
+if(HAVE_PIPE2)
+	add_definitions(-DHAVE_PIPE2)
+endif()
+
+check_function_exists(pledge HAVE_PLEDGE)
+if(HAVE_PLEDGE)
+	add_definitions(-DHAVE_PLEDGE)
+endif()
+
+check_function_exists(poll HAVE_POLL)
+if(HAVE_POLL)
+	add_definitions(-DHAVE_POLL)
+endif()
+
+check_function_exists(socketpair HAVE_SOCKETPAIR)
+if(HAVE_SOCKETPAIR)
+	add_definitions(-DHAVE_SOCKETPAIR)
+endif()
+
 check_include_files(endian.h HAVE_ENDIAN_H)
 if(HAVE_ENDIAN_H)
 	add_definitions(-DHAVE_ENDIAN_H)
