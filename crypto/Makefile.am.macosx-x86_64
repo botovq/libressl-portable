@@ -10,7 +10,6 @@ ASM_X86_64_MACOSX += md5/md5-macosx-x86_64.S
 ASM_X86_64_MACOSX += modes/ghash-macosx-x86_64.S
 ASM_X86_64_MACOSX += rc4/rc4-macosx-x86_64.S
 ASM_X86_64_MACOSX += sha/sha1-macosx-x86_64.S
-ASM_X86_64_MACOSX += sha/sha256-macosx-x86_64.S
 ASM_X86_64_MACOSX += sha/sha512-macosx-x86_64.S
 
 ASM_X86_64_MACOSX += bn/arch/amd64/bignum_add.S
