@@ -1,0 +1,3536 @@
+--- tests/mlkem1024_decap_tests.c.orig	2024-12-19 21:44:12.958518642 +0100
++++ tests/mlkem1024_decap_tests.c	2024-12-19 21:44:24.760511820 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem1024_decap_tests.c,v 1.2 2024/12/14 19:16:24 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -26,103 +29,170 @@
+ 
+ #include "mlkem_tests_util.h"
+ 
+-static void
+-MlkemDecapFileTest(CBS *c, CBS *k, CBS *dk, int should_fail)
++static int
++MlkemDecapTest(CBB *ciphertext_cbb, CBB *shared_secret_cbb,
++    CBB *private_key_cbb, int should_fail, size_t line)
+ {
+-	uint8_t shared_secret[MLKEM_SHARED_SECRET_BYTES];
+ 	struct MLKEM1024_private_key priv;
+-	int parse_ok, decap_ok;
+-
+-	parse_ok = MLKEM1024_parse_private_key(&priv, dk);
+-	if (!parse_ok) {
+-		TEST(!should_fail, "parse_private_key");
+-		return;
++	uint8_t *ciphertext = NULL, *shared_secret = NULL, *private_key = NULL;
++	size_t ciphertext_len = 0, shared_secret_len = 0, private_key_len = 0;
++	uint8_t shared_secret_buf[MLKEM_SHARED_SECRET_BYTES];
++	CBS private_key_cbs;
++	int failed = 1;
++
++	if (!CBB_finish(ciphertext_cbb, &ciphertext, &ciphertext_len))
++		goto err;
++	if (!CBB_finish(shared_secret_cbb, &shared_secret, &shared_secret_len))
++		goto err;
++	if (!CBB_finish(private_key_cbb, &private_key, &private_key_len))
++		goto err;
++
++	CBS_init(&private_key_cbs, private_key, private_key_len);
++
++	if (!MLKEM1024_parse_private_key(&priv, &private_key_cbs)) {
++		if ((failed = !should_fail))
++			warnx("#%zu: parse_private_key", line);
++		goto err;
++	}
++	if (!MLKEM1024_decap(shared_secret_buf, ciphertext, ciphertext_len,
++	    &priv)) {
++		if ((failed = !should_fail))
++			warnx("#%zu: decap", line);
++		goto err;
+ 	}
+-	decap_ok = MLKEM1024_decap(shared_secret, CBS_data(c), CBS_len(c),
+-	    &priv);
+-	if (!decap_ok) {
+-		TEST(!should_fail, "decap");
+-		return;
++
++	failed = compare_data(shared_secret, shared_secret_buf,
++	    MLKEM_SHARED_SECRET_BYTES, line, "shared_secret");
++
++	if (should_fail != failed) {
++		warnx("FAIL: #%zu: should_fail %d, failed %d",
++		    line, should_fail, failed);
++		failed = 1;
+ 	}
+-	TEST_DATAEQ(shared_secret, CBS_data(k),
+-	    MLKEM_SHARED_SECRET_BYTES, "shared_secret");
++
++ err:
++	CBB_cleanup(ciphertext_cbb);
++	CBB_cleanup(shared_secret_cbb);
++	CBB_cleanup(private_key_cbb);
++	freezero(ciphertext, ciphertext_len);
++	freezero(shared_secret, shared_secret_len);
++	freezero(private_key, private_key_len);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_COMMENT 1
+-#define S_PRIVATE_KEY 2
+-#define S_CIPHERTEXT 3
+-#define S_RESULT 4
+-#define S_SHARED_SECRET  5
++#define S_START			0
++#define S_COMMENT		1
++#define S_PRIVATE_KEY		2
++#define S_CIPHERTEXT		3
++#define S_RESULT		4
++#define S_SHARED_SECRET		5
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_COMMENT);
++	S2S(S_PRIVATE_KEY);
++	S2S(S_CIPHERTEXT);
++	S2S(S_RESULT);
++	S2S(S_SHARED_SECRET);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS ciphertext, shared_secret, private_key;
+-	const uint8_t *p = NULL;
++	CBB ciphertext = { 0 }, shared_secret = { 0 }, private_key = { 0 };
+ 	int should_fail = 0;
+-	char *buf;
++	const char *test;
++	size_t line = 0;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++
++	fprintf(stderr, "Testing decap test vectors in %s\n", test);
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
+ 
+-	fprintf(stderr, "Testing decap test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+ 	state = S_COMMENT;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
++	line = 0;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
++
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
+ 			state = S_COMMENT;
+ 			break;
+ 		case S_COMMENT:
+-			if (strncmp(buf, "#", 1) != 0)
+-				break;
++			if (!CBS_get_u8(&cbs, &u8))
++				errx(1, "#%zu %s: CBB_get_u8", line, msg);
++			assert(u8 == '#');
++			if (!CBS_skip(&cbs, CBS_len(&cbs)))
++				errx(1, "#%zu %s: CBB_skip", line, msg);
+ 			state = S_PRIVATE_KEY;
+ 			break;
+ 		case S_PRIVATE_KEY:
+-			if (strncmp(buf, "private_key: ",
+-			    strlen("private_key: ")) != 0)
+-				break;
+-			grab_data(&private_key, buf, strlen("private_key: "));
+-			p = CBS_data(&private_key);
++			if (!get_string_cbs(&cbs, "private_key: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &private_key, line, msg);
+ 			state = S_CIPHERTEXT;
+ 			break;
+ 		case S_CIPHERTEXT:
+-			if (strncmp(buf, "ciphertext: ",
+-			    strlen("ciphertext: ")) != 0)
+-				break;
+-			grab_data(&ciphertext, buf, strlen("ciphertext: "));
++			if (!get_string_cbs(&cbs, "ciphertext: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &ciphertext, line, msg);
+ 			state = S_RESULT;
+ 			break;
+ 		case S_RESULT:
+-			if (strncmp(buf, "result: pass",
+-			    strlen("result: pass")) != 0)
+-				should_fail = 1;
+-			else
+-				should_fail = 0;
++			if (!get_string_cbs(&cbs, "result: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			should_fail = get_string_cbs(&cbs, "fail", line, msg);
+ 			state = S_SHARED_SECRET;
+ 			break;
+ 		case S_SHARED_SECRET:
+-			if (strncmp(buf, "shared_secret: ",
+-			    strlen("shared_secret: ")) != 0)
+-				break;
+-			grab_data(&shared_secret, buf,
+-			    strlen("shared_secret: "));
+-			MlkemDecapFileTest(&ciphertext, &shared_secret,
+-			    &private_key, should_fail);
+-			free((void *)CBS_data(&ciphertext));
+-			free((void *)CBS_data(&shared_secret));
+-			free((void *)p);
++			if (!get_string_cbs(&cbs, "shared_secret: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &shared_secret, line, msg);
++
++			failed |= MlkemDecapTest(&ciphertext, &shared_secret,
++			    &private_key, should_fail, line);
+ 
+-			test_number++;
+ 			state = S_START;
+ 			break;
+ 		}
++		if (CBS_len(&cbs) > 0)
++			errx(1, "#%zu %s: CBS_len", line, msg);
+ 	}
+-
+ 	free(buf);
+-	exit(failure);
++
++	if (ferror(fp))
++		err(1, NULL);
++	fclose(fp);
++
++	return failed;
+ }
+--- tests/mlkem1024_encap_tests.c.orig	2024-12-19 21:44:12.958518642 +0100
++++ tests/mlkem1024_encap_tests.c	2024-12-19 21:44:24.760511820 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem1024_encap_tests.c,v 1.2 2024/12/14 19:16:24 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -24,112 +27,187 @@
+ #include <openssl/bytestring.h>
+ #include <openssl/mlkem.h>
+ 
++#include "mlkem_internal.h"
+ #include "mlkem_tests_util.h"
+ 
+-static void
+-MlkemEncapFileTest(CBS *entropy, CBS *public_key, CBS *expected_ciphertext,
+-    CBS *expected_shared_secret, int should_fail)
++static int
++MlkemEncapTest(CBB *entropy_cbb, CBB *pubkey, CBB *ciphertext_cbb,
++    CBB *shared_secret_cbb, int should_fail, size_t line)
+ {
+-	uint8_t shared_secret[MLKEM_SHARED_SECRET_BYTES];
+-	uint8_t ciphertext[MLKEM1024_CIPHERTEXT_BYTES];
+ 	struct MLKEM1024_public_key pub;
+-	int parse_ok;
++	uint8_t *entropy = NULL, *public_key = NULL, *ciphertext = NULL;
++	uint8_t *shared_secret = NULL;
++	size_t entropy_len = 0, public_key_len = 0, ciphertext_len = 0;
++	size_t shared_secret_len = 0;
++	uint8_t shared_secret_buf[MLKEM_SHARED_SECRET_BYTES];
++	uint8_t ciphertext_buf[MLKEM1024_CIPHERTEXT_BYTES];
++	CBS public_key_cbs;
++	int failed = 1;
++
++	if (!CBB_finish(entropy_cbb, &entropy, &entropy_len))
++		goto err;
++	if (!CBB_finish(pubkey, &public_key, &public_key_len))
++		goto err;
++	if (!CBB_finish(ciphertext_cbb, &ciphertext, &ciphertext_len))
++		goto err;
++	if (!CBB_finish(shared_secret_cbb, &shared_secret, &shared_secret_len))
++		goto err;
++
++	CBS_init(&public_key_cbs, public_key, public_key_len);
++
++	if (!MLKEM1024_parse_public_key(&pub, &public_key_cbs)) {
++		if ((failed = !should_fail))
++			warnx("#%zu: parse_public_key", line);
++		goto err;
++	}
++	MLKEM1024_encap_external_entropy(ciphertext_buf, shared_secret_buf,
++	    &pub, entropy);
+ 
+-	parse_ok = MLKEM1024_parse_public_key(&pub, public_key);
+-	if (!parse_ok) {
+-		TEST(!should_fail, "parse_public_key");
+-		return;
++	failed = compare_data(shared_secret, shared_secret_buf,
++	    MLKEM_SHARED_SECRET_BYTES, line, "shared_secret");
++	failed |= compare_data(ciphertext, ciphertext_buf,
++	    MLKEM1024_CIPHERTEXT_BYTES, line, "ciphertext");
++
++	if (should_fail != failed) {
++		warnx("FAIL: #%zu: should_fail %d, failed %d",
++		    line, should_fail, failed);
++		failed = 1;
+ 	}
+-	MLKEM1024_encap(ciphertext, shared_secret, &pub);
+-	TEST_DATAEQ(shared_secret, CBS_data(expected_shared_secret),
+-	    MLKEM_SHARED_SECRET_BYTES, "shared_secret");
+-	TEST_DATAEQ(ciphertext, CBS_data(expected_ciphertext),
+-	    MLKEM1024_CIPHERTEXT_BYTES, "shared_secret");
++
++ err:
++	CBB_cleanup(entropy_cbb);
++	CBB_cleanup(pubkey);
++	CBB_cleanup(ciphertext_cbb);
++	CBB_cleanup(shared_secret_cbb);
++	freezero(entropy, entropy_len);
++	freezero(public_key, public_key_len);
++	freezero(ciphertext, ciphertext_len);
++	freezero(shared_secret, shared_secret_len);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_COMMENT 1
+-#define S_ENTROPY 2
+-#define S_PUBLIC_KEY 3
+-#define S_RESULT 4
+-#define S_CIPHERTEXT 5
+-#define S_SHARED_SECRET  6
++#define S_START			0
++#define S_COMMENT		1
++#define S_ENTROPY		2
++#define S_PUBLIC_KEY		3
++#define S_RESULT		4
++#define S_CIPHERTEXT		5
++#define S_SHARED_SECRET		6
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_COMMENT);
++	S2S(S_ENTROPY);
++	S2S(S_PUBLIC_KEY);
++	S2S(S_RESULT);
++	S2S(S_CIPHERTEXT);
++	S2S(S_SHARED_SECRET);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS entropy, public_key, ciphertext, shared_secret;
+-	const uint8_t *p = NULL;
++	CBB entropy = { 0 }, public_key = { 0 }, ciphertext = { 0 }, shared_secret = { 0 };
+ 	int should_fail = 0;
+-	char *buf;
++	const char *test;
++	size_t line;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++	line = 0;
++
++	fprintf(stderr, "Testing encap test vectors in %s\n", test);
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
+ 
+-	fprintf(stderr, "Testing encap test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+ 	state = S_COMMENT;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
++	line = 0;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
++
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
+ 			state = S_COMMENT;
+ 			break;
+ 		case S_COMMENT:
+-			if (strncmp(buf, "#", 1) != 0)
+-				break;
++			if (!CBS_get_u8(&cbs, &u8))
++				errx(1, "#%zu %s: CBB_get_u8", line, msg);
++			assert(u8 == '#');
++			if (!CBS_skip(&cbs, CBS_len(&cbs)))
++				errx(1, "#%zu %s: CBB_skip", line, msg);
+ 			state = S_ENTROPY;
+ 			break;
+ 		case S_ENTROPY:
+-			if (strncmp(buf, "entropy: ", strlen("entropy: ")) != 0)
+-				break;
+-			grab_data(&entropy, buf, strlen("entropy: "));
+-			p = CBS_data(&entropy);
++			if (!get_string_cbs(&cbs, "entropy: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &entropy, line, msg);
+ 			state = S_PUBLIC_KEY;
+ 			break;
+ 		case S_PUBLIC_KEY:
+-			if (strncmp(buf, "public_key: ",
+-			    strlen("public_key: ")) != 0)
+-				break;
+-			grab_data(&public_key, buf, strlen("public_key: "));
+-			p = CBS_data(&public_key);
++			if (!get_string_cbs(&cbs, "public_key = ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &public_key, line, msg);
+ 			state = S_RESULT;
+ 			break;
+ 		case S_RESULT:
+-			if (strncmp(buf, "result: pass",
+-			    strlen("result: pass")) != 0)
+-				should_fail = 1;
+-			else
+-				should_fail = 0;
++			if (!get_string_cbs(&cbs, "result: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			should_fail = get_string_cbs(&cbs, "fail", line, msg);
+ 			state = S_CIPHERTEXT;
+ 			break;
+ 		case S_CIPHERTEXT:
+-			if (strncmp(buf, "ciphertext: ",
+-			    strlen("ciphertext: ")) != 0)
+-				break;
+-			grab_data(&ciphertext, buf, strlen("ciphertext: "));
+-			state = S_RESULT;
++			if (!get_string_cbs(&cbs, "ciphertext: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &ciphertext, line, msg);
++			state = S_SHARED_SECRET;
+ 			break;
+ 		case S_SHARED_SECRET:
+-			if (strncmp(buf, "shared_secret: ",
+-			    strlen("shared_secret: ")) != 0)
+-				break;
+-			grab_data(&shared_secret, buf,
+-			    strlen("shared_secret: "));
+-			MlkemEncapFileTest(&entropy, &public_key, &ciphertext,
+-			    &shared_secret, should_fail);
+-			free((void *)CBS_data(&ciphertext));
+-			free((void *)CBS_data(&shared_secret));
+-			free((void *)p);
++			if (!get_string_cbs(&cbs, "shared_secret: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &shared_secret, line, msg);
++
++			failed |= MlkemEncapTest(&entropy, &public_key,
++			    &ciphertext, &shared_secret, should_fail, line);
+ 
+-			test_number++;
+ 			state = S_START;
+ 			break;
+ 		}
++		if (CBS_len(&cbs) > 0)
++			errx(1, "#%zu %s: CBS_len", line, msg);
+ 	}
+-
+ 	free(buf);
+-	exit(failure);
++
++	if (ferror(fp))
++		err(1, NULL);
++	fclose(fp);
++
++	return failed;
+ }
+--- tests/mlkem1024_iteration_test.c.orig	2024-12-19 21:44:12.958518642 +0100
++++ tests/mlkem1024_iteration_test.c	2024-12-19 21:44:24.761511819 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem1024_iteration_test.c,v 1.2 2024/12/14 19:16:24 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,7 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -27,21 +29,6 @@
+ #include "mlkem_tests_util.h"
+ #include "sha3_internal.h"
+ 
+-static int
+-encode_private_key(const struct MLKEM1024_private_key *priv, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM1024_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM1024_marshal_private_key(&cbb, priv))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+ /*
+  * The structure of this test is taken from
+  *  https://github.com/C2SP/CCTV/blob/main/ML-KEM/README.md?ref=words.filippo.io#accumulated-pq-crystals-vectors
+@@ -52,8 +39,8 @@ encode_private_key(const struct MLKEM102
+  * (The RNG stream starts with 7f9c2ba4e88f827d616045507605853e.)
+  */
+ 
+-static void
+-MlkemIterativeTest()
++static int
++MlkemIterativeTest(void)
+ {
+ 	/* https://github.com/C2SP/CCTV/tree/main/ML-KEM */
+ 	/*
+@@ -101,8 +88,9 @@ MlkemIterativeTest()
+ 		 */
+ 		shake_out(&drng, seed, sizeof(seed));
+ 		if (i == 0) {
+-			TEST_DATAEQ(seed, kExpectedSeedStart,
+-			    sizeof(kExpectedSeedStart), "seed start");
++			if (compare_data(seed, kExpectedSeedStart,
++			    sizeof(kExpectedSeedStart), 0, "seed start") != 0)
++				errx(1, "compare_data");
+ 		}
+ 
+ 		/* generate ek as encoded_public_key */
+@@ -115,8 +103,9 @@ MlkemIterativeTest()
+ 		    sizeof(encoded_public_key));
+ 
+ 		/* marshal priv to dk as encoded_private_key */
+-		TEST(!encode_private_key(&priv, &encoded_private_key,
+-		    &encoded_private_key_len), "encode_private_key");
++		if (!mlkem1024_encode_private_key(&priv, &encoded_private_key,
++		    &encoded_private_key_len))
++			errx(1, "mlkem1024_encode_private_key");
+ 
+ 		/* hash in dk */
+ 		shake_update(&results, encoded_private_key,
+@@ -141,21 +130,21 @@ MlkemIterativeTest()
+ 		    sizeof(invalid_ciphertext));
+ 
+ 		/* generte k as shared secret from invalid ciphertext */
+-		TEST(!MLKEM1024_decap(shared_secret, invalid_ciphertext,
+-		    sizeof(invalid_ciphertext), &priv), "decap failed!");
++		if (!MLKEM1024_decap(shared_secret, invalid_ciphertext,
++		    sizeof(invalid_ciphertext), &priv))
++			errx(1, "decap failed");
+ 
+ 		/* hash in k */
+ 		shake_update(&results, shared_secret, sizeof(shared_secret));
+ 	}
+ 	shake_xof(&results);
+-	shake_out(&results, out, 32);
++	shake_out(&results, out, sizeof(out));
+ 
+-	TEST_DATAEQ(out, kExpectedAdam, 32, "final result hash");
++	return compare_data(kExpectedAdam, out, sizeof(out), i, "final result hash");
+ }
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	MlkemIterativeTest();
+-	exit(failure);
++	return MlkemIterativeTest();
+ }
+--- tests/mlkem1024_keygen_tests.c.orig	2024-12-19 21:44:12.959518641 +0100
++++ tests/mlkem1024_keygen_tests.c	2024-12-19 21:44:24.761511819 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem1024_keygen_tests.c,v 1.4 2024/12/17 07:20:10 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -28,103 +31,163 @@
+ #include "mlkem_tests_util.h"
+ 
+ static int
+-encode_private_key(const struct MLKEM1024_private_key *priv, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM1024_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM1024_marshal_private_key(&cbb, priv))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+-static void
+-MlkemKeygenFileTest(CBS *seed, CBS *public_key, CBS *private_key)
++MlkemKeygenTest(CBB *seed_cbb, CBB *public_key_cbb, CBB *private_key_cbb,
++    size_t line)
+ {
+ 	struct MLKEM1024_private_key priv;
++	uint8_t *seed = NULL, *public_key = NULL, *private_key = NULL;
++	size_t seed_len = 0, public_key_len = 0, private_key_len = 0;
+ 	uint8_t *encoded_private_key = NULL;
+ 	uint8_t encoded_public_key[MLKEM1024_PUBLIC_KEY_BYTES];
+ 	size_t len;
++	int failed = 1;
++
++	if (!CBB_finish(seed_cbb, &seed, &seed_len))
++		goto err;
++	if (!compare_length(MLKEM_SEED_BYTES, seed_len, line, "seed length"))
++		goto err;
++	if (!CBB_finish(public_key_cbb, &public_key, &public_key_len))
++		goto err;
++	if (!compare_length(MLKEM1024_PUBLIC_KEY_BYTES, public_key_len, line,
++	    "public key length"))
++		goto err;
++	if (!CBB_finish(private_key_cbb, &private_key, &private_key_len))
++		goto err;
++	if (!compare_length(MLKEM1024_PUBLIC_KEY_BYTES, public_key_len, line,
++	    "public key length"))
++		goto err;
+ 
+-	TEST(CBS_len(seed) != MLKEM_SEED_BYTES, "seed len bogus");
+-	TEST(CBS_len(private_key) != MLKEM1024_PRIVATE_KEY_BYTES,
+-	    "expected private key len bogus");
+-	TEST(CBS_len(public_key) != MLKEM1024_PUBLIC_KEY_BYTES,
+-	    "expected public key len bogus");
+ 	MLKEM1024_generate_key_external_entropy(encoded_public_key, &priv,
+-	    CBS_data(seed));
+-	TEST(!encode_private_key(&priv, &encoded_private_key,
+-	    &len), "encode_private_key");
+-	TEST(len != MLKEM1024_PRIVATE_KEY_BYTES, "private key len bogus");
+-	TEST_DATAEQ(encoded_public_key, CBS_data(public_key),
+-	    MLKEM1024_PUBLIC_KEY_BYTES, "public key");
+-	TEST_DATAEQ(encoded_private_key, CBS_data(private_key),
+-	    MLKEM1024_PRIVATE_KEY_BYTES, "private key");
++	    seed);
++	if (!mlkem1024_encode_private_key(&priv, &encoded_private_key, &len)) {
++		warnx("#%zu: encoded_private_key", line);
++		goto err;
++	}
++
++	if (!compare_length(MLKEM1024_PRIVATE_KEY_BYTES, len, line,
++	    "private key length"))
++		goto err;
++
++	failed = compare_data(private_key, encoded_private_key,
++	    MLKEM1024_PRIVATE_KEY_BYTES, line, "private key");
++	failed |= compare_data(public_key, encoded_public_key,
++	    MLKEM1024_PUBLIC_KEY_BYTES, line, "public key");
++
++ err:
++	CBB_cleanup(seed_cbb);
++	CBB_cleanup(public_key_cbb);
++	CBB_cleanup(private_key_cbb);
++	freezero(seed, seed_len);
++	freezero(public_key, public_key_len);
++	freezero(private_key, private_key_len);
+ 	free(encoded_private_key);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_SEED 1
+-#define S_PUBLIC_KEY  2
+-#define S_PRIVATE_KEY	3
++#define S_START		0
++#define S_COMMENT	1
++#define S_SEED		2
++#define S_PUBLIC_KEY	3
++#define S_PRIVATE_KEY	4
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_COMMENT);
++	S2S(S_SEED);
++	S2S(S_PUBLIC_KEY);
++	S2S(S_PRIVATE_KEY);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS seed, public_key, private_key;
+-	char *buf;
++	CBB seed = { 0 }, public_key = { 0 }, private_key = { 0 };
++	const char *test;
++	size_t line = 0;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++
++	fprintf(stderr, "Testing keygen test vectors in %s\n", test);
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
++
++	state = S_COMMENT;
++	line = 0;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
+ 
+-	fprintf(stderr, "Testing keygen test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+-	state = S_SEED;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
++			state = S_COMMENT;
++			break;
++		case S_COMMENT:
++			if (!CBS_get_u8(&cbs, &u8))
++				errx(1, "#%zu %s: CBB_get_u8", line, msg);
++			assert(u8 == '#');
++			if (!CBS_skip(&cbs, CBS_len(&cbs)))
++				errx(1, "#%zu %s: CBB_skip", line, msg);
+ 			state = S_SEED;
+ 			break;
+ 		case S_SEED:
+-			if (strncmp(buf, "seed: ", strlen("seed: ")) != 0) {
+-				break;
+-			}
+-			grab_data(&seed, buf, strlen("seed: "));
++			if (!get_string_cbs(&cbs, "seed: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &seed, line, msg);
+ 			state = S_PUBLIC_KEY;
+ 			break;
+ 		case S_PUBLIC_KEY:
+-			if (strncmp(buf, "public_key: ",
+-			    strlen("public_key: ")) != 0)
+-				break;
+-			grab_data(&public_key, buf, strlen("public_key: "));
++			if (!get_string_cbs(&cbs, "public_key: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &public_key, line, msg);
+ 			state = S_PRIVATE_KEY;
+ 			break;
+ 		case S_PRIVATE_KEY:
+-			if (strncmp(buf, "private_key: ",
+-			    strlen("private_key: ")) != 0)
+-				break;
+-			grab_data(&private_key, buf, strlen("private_key: "));
+-			state = S_START;
++			if (!get_string_cbs(&cbs, "private_key: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &private_key, line, msg);
+ 
+-			MlkemKeygenFileTest(&seed, &public_key, &private_key);
+-			free((void *)CBS_data(&seed));
+-			free((void *)CBS_data(&public_key));
+-			free((void *)CBS_data(&private_key));
++			failed |= MlkemKeygenTest(&seed, &public_key,
++			    &private_key, line);
+ 
+-			test_number++;
+ 			state = S_START;
+ 			break;
+ 		}
++		if (CBS_len(&cbs) > 0)
++			errx(1, "#%zu %s: CBS_len", line, msg);
+ 	}
+-
+ 	free(buf);
++
++	if (ferror(fp))
++		err(1, NULL);
+ 	fclose(fp);
+-	exit(failure);
++
++	return failed;
+ }
+--- tests/mlkem1024_nist_decap_tests.c.orig	2024-12-19 21:44:12.959518641 +0100
++++ tests/mlkem1024_nist_decap_tests.c	2024-12-19 21:44:24.762511819 +0100
+@@ -16,6 +16,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -27,85 +29,165 @@
+ #include "mlkem_internal.h"
+ #include "mlkem_tests_util.h"
+ 
+-static void
+-MlkemNistDecapFileTest(CBS *c, CBS *k, CBS *dk)
++static int
++MlkemNistDecapFileTest(CBB *c_cbb, CBB *k_cbb, CBS *dk, size_t line)
+ {
++	uint8_t *c = NULL, *k = NULL;
++	size_t c_len = 0, k_len = 0;
+ 	uint8_t shared_secret[MLKEM_SHARED_SECRET_BYTES];
+ 	struct MLKEM1024_private_key priv;
++	int failed = 1;
+ 
+-	TEST(CBS_len(dk) != MLKEM1024_PRIVATE_KEY_BYTES,
+-	    "private key len bogus");
+-	TEST(CBS_len(k) != MLKEM_SHARED_SECRET_BYTES,
+-	    "shared secret len bogus");
+-
+-	TEST(!MLKEM1024_parse_private_key(&priv, dk), "parse_private_key");
+-	TEST(!MLKEM1024_decap(shared_secret, CBS_data(c), CBS_len(c), &priv),
+-	    "decap");
+-	TEST_DATAEQ(shared_secret, CBS_data(k),
+-	    MLKEM_SHARED_SECRET_BYTES, "shared_secret");
++	if (!CBB_finish(c_cbb, &c, &c_len))
++		goto err;
++	if (!CBB_finish(k_cbb, &k, &k_len))
++		goto err;
++
++	if (!compare_length(MLKEM1024_PRIVATE_KEY_BYTES, CBS_len(dk), line,
++	    "private key len bogus"))
++		goto err;
++	if (!compare_length(MLKEM_SHARED_SECRET_BYTES, k_len, line,
++	    "shared secret len bogus"))
++		goto err;
++
++	if (!MLKEM1024_parse_private_key(&priv, dk)) {
++		warnx("#%zu MLKEM1024_parse_private_key", line);
++		goto err;
++	}
++	if (!MLKEM1024_decap(shared_secret, c, c_len, &priv)) {
++		warnx("#%zu MLKEM1024_decap", line);
++		goto err;
++	}
++
++	failed = compare_data(shared_secret, k, k_len, line, "shared_secret");
++
++ err:
++	CBB_cleanup(c_cbb);
++	CBB_cleanup(k_cbb);
++	freezero(c, c_len);
++	freezero(k, k_len);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_CIPHERTEXT 1
+-#define S_SHARED_SECRET  2
+-#define S_PRIVATE_KEY 3
++#define S_START		0
++#define S_C		1
++#define S_K		2
++#define S_EMPTY		3
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_C);
++	S2S(S_K);
++	S2S(S_EMPTY);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS ciphertext, shared_secret, private_key;
+-	const uint8_t *p;
+-	char *buf;
++	CBB dk_cbb = { 0 }, c = { 0 }, k = { 0 };
++	CBS instr;
++	uint8_t *dk = NULL;
++	size_t dk_len = 0;
++	uint8_t bracket, newline;
++	const char *test;
++	size_t line;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
++
++	if ((len = getline(&buf, &buflen, fp)) == -1)
++		err(1, "failed to read instruction line");
++
++	/*
++	 * The private key is enclosed in brackets in an "instruction line".
++	 */
++	line = 1;
++	CBS_init(&instr, buf, len);
++	if (!CBS_get_u8(&instr, &bracket))
++		err(1, "failed to parse instruction line '['");
++	assert(bracket == '[');
++	if (!CBS_get_last_u8(&instr, &newline))
++		errx(1, "failed to parse instruction line '\\n'");
++	assert(newline == '\n');
++	if (!CBS_get_last_u8(&instr, &bracket))
++		errx(1, "failed to parse instruction line ']'");
++	assert(bracket == ']');
++	if (!get_string_cbs(&instr, "dk: ", line, "private key"))
++		errx(1, "failed to read instruction line 'dk: '");
++	hex_decode_cbs(&instr, &dk_cbb, line, "private key");
++	assert(CBS_len(&instr) == 0);
++
++	if (!CBB_finish(&dk_cbb, &dk, &dk_len))
++		errx(1, "CBB finish instruction line");
++
++	state = S_START;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs, dk_cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
+ 
+-	fprintf(stderr, "Testing NIST decap test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+-	state = S_CIPHERTEXT;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
+-			state = S_CIPHERTEXT;
++			state = S_C;
+ 			break;
+-		case S_CIPHERTEXT:
+-			if (strncmp(buf, "ciphertext: ",
+-			    strlen("ciphertext: ")) != 0) {
+-				break;
+-			}
+-			grab_data(&ciphertext, buf, strlen("ciphertext: "));
+-			state = S_SHARED_SECRET;
++		case S_C:
++			if (!get_string_cbs(&cbs, "c: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &c, line, msg);
++			state = S_K;
+ 			break;
+-		case S_SHARED_SECRET:
+-			if (strncmp(buf, "shared_secret: ",
+-			    strlen("shared_secret: ")) != 0)
+-				break;
+-			grab_data(&shared_secret, buf,
+-			    strlen("shared_secret: "));
+-			state = S_PRIVATE_KEY;
++		case S_K:
++			if (!get_string_cbs(&cbs, "k: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &k, line, msg);
++			state = S_EMPTY;
+ 			break;
+-		case S_PRIVATE_KEY:
+-			if (strncmp(buf, "private_key: ",
+-			    strlen("private_key: ")) != 0)
+-				break;
+-			grab_data(&private_key, buf, strlen("private_key: "));
+-			p = CBS_data(&private_key);
+-
+-			MlkemNistDecapFileTest(&ciphertext, &shared_secret,
+-			    &private_key);
+-			free((void *)CBS_data(&ciphertext));
+-			free((void *)CBS_data(&shared_secret));
+-			free((void *)p);
++		case S_EMPTY:
++			CBS_init(&dk_cbs, dk, dk_len);
++
++			failed |= MlkemNistDecapFileTest(&c, &k, &dk_cbs, line);
+ 
+-			state = S_START;
+-			test_number++;
++			state = S_C;
+ 			break;
+ 		}
++		if (CBS_len(&cbs) > 0)
++			errx(1, "#%zu %s: CBS_len", line, msg);
+ 	}
+-
+ 	free(buf);
+-	exit(failure);
++
++	if (ferror(fp))
++		err(1, NULL);
++	fclose(fp);
++
++	freezero(dk, dk_len);
++
++	return failed;
+ }
+--- tests/mlkem1024_nist_keygen_tests.c.orig	2024-12-19 21:44:12.959518641 +0100
++++ tests/mlkem1024_nist_keygen_tests.c	2024-12-19 21:44:24.762511819 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem1024_nist_keygen_tests.c,v 1.3 2024/12/17 07:20:10 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -28,111 +31,170 @@
+ #include "mlkem_tests_util.h"
+ 
+ static int
+-encode_private_key(const struct MLKEM1024_private_key *priv, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM1024_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM1024_marshal_private_key(&cbb, priv))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+-static void
+-MlkemNistKeygenFileTest(CBS *z, CBS *d, CBS *ek, CBS *dk)
++MlkemNistKeygenTest(CBB *z_cbb, CBB *d_cbb, CBB *ek_cbb, CBB *dk_cbb,
++    size_t line)
+ {
++	CBB seed_cbb;
++	uint8_t *z = NULL, *d = NULL, *ek = NULL, *dk = NULL;
++	size_t z_len = 0, d_len = 0, ek_len = 0, dk_len = 0;
+ 	uint8_t seed[MLKEM_SEED_BYTES];
+ 	struct MLKEM1024_private_key priv;
+ 	uint8_t *encoded_private_key = NULL;
+ 	uint8_t encoded_public_key[MLKEM1024_PUBLIC_KEY_BYTES];
+ 	size_t len;
++	int failed = 1;
++
++	if (!CBB_init_fixed(&seed_cbb, seed, sizeof(seed)))
++		goto err;
++
++	if (!CBB_finish(z_cbb, &z, &z_len))
++		goto err;
++	if (!CBB_finish(d_cbb, &d, &d_len))
++		goto err;
++	if (!CBB_finish(ek_cbb, &ek, &ek_len))
++		goto err;
++	if (!CBB_finish(dk_cbb, &dk, &dk_len))
++		goto err;
++
++	if (!CBB_add_bytes(&seed_cbb, d, d_len))
++		goto err;
++	if (!CBB_add_bytes(&seed_cbb, z, z_len))
++		goto err;
++	if (!CBB_finish(&seed_cbb, NULL, &len))
++		goto err;
++
++	if (!compare_length(MLKEM_SEED_BYTES, len, line, "z or d length bogus"))
++		goto err;
+ 
+-	TEST(CBS_len(d) != (MLKEM_SEED_BYTES / 2), "d len bogus");
+-	TEST(CBS_len(z) != (MLKEM_SEED_BYTES / 2), "z len bogus");
+-	TEST(CBS_len(dk) != MLKEM1024_PRIVATE_KEY_BYTES,
+-	    "expected private key len bogus");
+-	TEST(CBS_len(ek) != MLKEM1024_PUBLIC_KEY_BYTES,
+-	    "expected public key len bogus");
+-	memcpy(&seed[0], CBS_data(d), CBS_len(d));
+-	memcpy(&seed[MLKEM_SEED_BYTES / 2], CBS_data(z), CBS_len(z));
+ 	MLKEM1024_generate_key_external_entropy(encoded_public_key, &priv, seed);
+-	TEST(!encode_private_key(&priv, &encoded_private_key,
+-	    &len), "encode_private_key");
+-	TEST(len != MLKEM1024_PRIVATE_KEY_BYTES, "private key len bogus");
+-	TEST_DATAEQ(encoded_public_key, CBS_data(ek),
+-	    MLKEM1024_PUBLIC_KEY_BYTES, "public key");
+-	TEST_DATAEQ(encoded_private_key, CBS_data(dk),
+-	    MLKEM1024_PRIVATE_KEY_BYTES, "private key");
++
++	if (!mlkem1024_encode_private_key(&priv, &encoded_private_key, &len)) {
++		warnx("#%zu mlkem1024_encode_private_key", line);
++		goto err;
++	}
++
++	if (!compare_length(MLKEM1024_PRIVATE_KEY_BYTES, len, line,
++	    "private key length"))
++		goto err;
++
++	failed = compare_data(ek, encoded_public_key, MLKEM1024_PUBLIC_KEY_BYTES,
++	    line, "public key");
++	failed |= compare_data(dk, encoded_private_key, MLKEM1024_PRIVATE_KEY_BYTES,
++	    line, "private key");
++
++ err:
++	CBB_cleanup(&seed_cbb);
++	CBB_cleanup(z_cbb);
++	CBB_cleanup(d_cbb);
++	CBB_cleanup(ek_cbb);
++	CBB_cleanup(dk_cbb);
++	freezero(z, z_len);
++	freezero(d, d_len);
++	freezero(ek, ek_len);
++	freezero(dk, dk_len);
+ 	free(encoded_private_key);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_Z 1
+-#define S_D  2
+-#define S_EK	3
+-#define S_DK	4
++#define S_START		0
++#define S_Z		1
++#define S_D		2
++#define S_EK		3
++#define S_DK		4
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_Z);
++	S2S(S_D);
++	S2S(S_EK);
++	S2S(S_DK);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS z, d, ek, dk;
+-	char *buf;
++	CBB z = { 0 }, d = { 0 }, ek = { 0 }, dk = { 0 };
++	const char *test;
++	size_t line = 0;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++
++	fprintf(stderr, "Testing NIST keygen test vectors in %s\n", test);
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
+ 
+-	fprintf(stderr, "Testing NIST keygen test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+ 	state = S_Z;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
++	line = 0;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
++
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
+ 			state = S_Z;
+ 			break;
+ 		case S_Z:
+-			if (strncmp(buf, "z: ", strlen("z: ")) != 0) {
+-				break;
+-			}
+-			grab_data(&z, buf, strlen("z: "));
++			if (!get_string_cbs(&cbs, "z: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &z, line, msg);
+ 			state = S_D;
+ 			break;
+ 		case S_D:
+-			if (strncmp(buf, "d: ", strlen("d: ")) != 0)
+-				break;
+-			grab_data(&d, buf, strlen("d: "));
++			if (!get_string_cbs(&cbs, "d: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &d, line, msg);
+ 			state = S_EK;
+ 			break;
+ 		case S_EK:
+-			if (strncmp(buf, "ek: ", strlen("ek: ")) != 0)
+-				break;
+-			grab_data(&ek, buf, strlen("ek: "));
++			if (!get_string_cbs(&cbs, "ek: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &ek, line, msg);
+ 			state = S_DK;
+ 			break;
+ 		case S_DK:
+-			if (strncmp(buf, "dk: ", strlen("dk: ")) != 0)
+-				break;
+-			grab_data(&dk, buf, strlen("dk: "));
+-
+-			MlkemNistKeygenFileTest(&z, &d, &ek, &dk);
+-			free((void *)CBS_data(&z));
+-			free((void *)CBS_data(&d));
+-			free((void *)CBS_data(&ek));
+-			free((void *)CBS_data(&dk));
++			if (!get_string_cbs(&cbs, "dk: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &dk, line, msg);
++
++			failed |= MlkemNistKeygenTest(&z, &d, &ek, &dk, line);
+ 
+-			test_number++;
+ 			state = S_START;
+ 			break;
+ 		}
+ 	}
+-
+ 	free(buf);
++
++	if (ferror(fp))
++		err(1, NULL);
+ 	fclose(fp);
+-	exit(failure);
++
++	return failed;
+ }
+--- tests/mlkem768_decap_tests.c.orig	2024-12-19 21:44:12.959518641 +0100
++++ tests/mlkem768_decap_tests.c	2024-12-19 21:44:24.762511819 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem768_decap_tests.c,v 1.2 2024/12/14 19:16:24 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -26,103 +29,170 @@
+ 
+ #include "mlkem_tests_util.h"
+ 
+-static void
+-MlkemDecapFileTest(CBS *c, CBS *k, CBS *dk, int should_fail)
++static int
++MlkemDecapTest(CBB *ciphertext_cbb, CBB *shared_secret_cbb,
++    CBB *private_key_cbb, int should_fail, size_t line)
+ {
+-	uint8_t shared_secret[MLKEM_SHARED_SECRET_BYTES];
+ 	struct MLKEM768_private_key priv;
+-	int parse_ok, decap_ok;
+-
+-	parse_ok = MLKEM768_parse_private_key(&priv, dk);
+-	if (!parse_ok) {
+-		TEST(!should_fail, "parse_private_key");
+-		return;
++	uint8_t *ciphertext = NULL, *shared_secret = NULL, *private_key = NULL;
++	size_t ciphertext_len = 0, shared_secret_len = 0, private_key_len = 0;
++	uint8_t shared_secret_buf[MLKEM_SHARED_SECRET_BYTES];
++	CBS private_key_cbs;
++	int failed = 1;
++
++	if (!CBB_finish(ciphertext_cbb, &ciphertext, &ciphertext_len))
++		goto err;
++	if (!CBB_finish(shared_secret_cbb, &shared_secret, &shared_secret_len))
++		goto err;
++	if (!CBB_finish(private_key_cbb, &private_key, &private_key_len))
++		goto err;
++
++	CBS_init(&private_key_cbs, private_key, private_key_len);
++
++	if (!MLKEM768_parse_private_key(&priv, &private_key_cbs)) {
++		if ((failed = !should_fail))
++			warnx("#%zu: parse_private_key", line);
++		goto err;
++	}
++	if (!MLKEM768_decap(shared_secret_buf, ciphertext, ciphertext_len,
++	    &priv)) {
++		if ((failed = !should_fail))
++			warnx("#%zu: decap", line);
++		goto err;
+ 	}
+-	decap_ok = MLKEM768_decap(shared_secret, CBS_data(c), CBS_len(c),
+-	    &priv);
+-	if (!decap_ok) {
+-		TEST(!should_fail, "decap");
+-		return;
++
++	failed = compare_data(shared_secret, shared_secret_buf,
++	    MLKEM_SHARED_SECRET_BYTES, line, "shared_secret");
++
++	if (should_fail != failed) {
++		warnx("FAIL: #%zu: should_fail %d, failed %d",
++		    line, should_fail, failed);
++		failed = 1;
+ 	}
+-	TEST_DATAEQ(shared_secret, CBS_data(k),
+-	    MLKEM_SHARED_SECRET_BYTES, "shared_secret");
++
++ err:
++	CBB_cleanup(ciphertext_cbb);
++	CBB_cleanup(shared_secret_cbb);
++	CBB_cleanup(private_key_cbb);
++	freezero(ciphertext, ciphertext_len);
++	freezero(shared_secret, shared_secret_len);
++	freezero(private_key, private_key_len);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_COMMENT 1
+-#define S_PRIVATE_KEY 2
+-#define S_CIPHERTEXT 3
+-#define S_RESULT 4
+-#define S_SHARED_SECRET  5
++#define S_START			0
++#define S_COMMENT		1
++#define S_PRIVATE_KEY		2
++#define S_CIPHERTEXT		3
++#define S_RESULT		4
++#define S_SHARED_SECRET		5
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_COMMENT);
++	S2S(S_PRIVATE_KEY);
++	S2S(S_CIPHERTEXT);
++	S2S(S_RESULT);
++	S2S(S_SHARED_SECRET);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS ciphertext, shared_secret, private_key;
+-	const uint8_t *p = NULL;
++	CBB ciphertext = { 0 }, shared_secret = { 0 }, private_key = { 0 };
+ 	int should_fail = 0;
+-	char *buf;
++	const char *test;
++	size_t line = 0;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++
++	fprintf(stderr, "Testing decap test vectors in %s\n", test);
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
+ 
+-	fprintf(stderr, "Testing decap test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+ 	state = S_COMMENT;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
++	line = 0;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
++
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
+ 			state = S_COMMENT;
+ 			break;
+ 		case S_COMMENT:
+-			if (strncmp(buf, "#", 1) != 0)
+-				break;
++			if (!CBS_get_u8(&cbs, &u8))
++				errx(1, "#%zu %s: CBB_get_u8", line, msg);
++			assert(u8 == '#');
++			if (!CBS_skip(&cbs, CBS_len(&cbs)))
++				errx(1, "#%zu %s: CBB_skip", line, msg);
+ 			state = S_PRIVATE_KEY;
+ 			break;
+ 		case S_PRIVATE_KEY:
+-			if (strncmp(buf, "private_key: ",
+-			    strlen("private_key: ")) != 0)
+-				break;
+-			grab_data(&private_key, buf, strlen("private_key: "));
+-			p = CBS_data(&private_key);
++			if (!get_string_cbs(&cbs, "private_key: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &private_key, line, msg);
+ 			state = S_CIPHERTEXT;
+ 			break;
+ 		case S_CIPHERTEXT:
+-			if (strncmp(buf, "ciphertext: ",
+-			    strlen("ciphertext: ")) != 0)
+-				break;
+-			grab_data(&ciphertext, buf, strlen("ciphertext: "));
++			if (!get_string_cbs(&cbs, "ciphertext: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &ciphertext, line, msg);
+ 			state = S_RESULT;
+ 			break;
+ 		case S_RESULT:
+-			if (strncmp(buf, "result: pass",
+-			    strlen("result: pass")) != 0)
+-				should_fail = 1;
+-			else
+-				should_fail = 0;
++			if (!get_string_cbs(&cbs, "result: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			should_fail = get_string_cbs(&cbs, "fail", line, msg);
+ 			state = S_SHARED_SECRET;
+ 			break;
+ 		case S_SHARED_SECRET:
+-			if (strncmp(buf, "shared_secret: ",
+-			    strlen("shared_secret: ")) != 0)
+-				break;
+-			grab_data(&shared_secret, buf,
+-			    strlen("shared_secret: "));
+-			MlkemDecapFileTest(&ciphertext, &shared_secret,
+-			    &private_key, should_fail);
+-			free((void *)CBS_data(&ciphertext));
+-			free((void *)CBS_data(&shared_secret));
+-			free((void *)p);
++			if (!get_string_cbs(&cbs, "shared_secret: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &shared_secret, line, msg);
++
++			failed |= MlkemDecapTest(&ciphertext, &shared_secret,
++			    &private_key, should_fail, line);
+ 
+-			test_number++;
+ 			state = S_START;
+ 			break;
+ 		}
++		if (CBS_len(&cbs) > 0)
++			errx(1, "#%zu %s: CBS_len", line, msg);
+ 	}
+-
+ 	free(buf);
+-	exit(failure);
++
++	if (ferror(fp))
++		err(1, NULL);
++	fclose(fp);
++
++	return failed;
+ }
+--- tests/mlkem768_encap_tests.c.orig	2024-12-19 21:44:12.960518641 +0100
++++ tests/mlkem768_encap_tests.c	2024-12-19 21:44:24.763511818 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem768_encap_tests.c,v 1.2 2024/12/14 19:16:24 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -24,112 +27,187 @@
+ #include <openssl/bytestring.h>
+ #include <openssl/mlkem.h>
+ 
++#include "mlkem_internal.h"
+ #include "mlkem_tests_util.h"
+ 
+-static void
+-MlkemEncapFileTest(CBS *entropy, CBS *public_key, CBS *expected_ciphertext,
+-    CBS *expected_shared_secret, int should_fail)
++static int
++MlkemEncapTest(CBB *entropy_cbb, CBB *pubkey, CBB *ciphertext_cbb,
++    CBB *shared_secret_cbb, int should_fail, size_t line)
+ {
+-	uint8_t shared_secret[MLKEM_SHARED_SECRET_BYTES];
+-	uint8_t ciphertext[MLKEM768_CIPHERTEXT_BYTES];
+ 	struct MLKEM768_public_key pub;
+-	int parse_ok;
++	uint8_t *entropy = NULL, *public_key = NULL, *ciphertext = NULL;
++	uint8_t *shared_secret = NULL;
++	size_t entropy_len = 0, public_key_len = 0, ciphertext_len = 0;
++	size_t shared_secret_len = 0;
++	uint8_t shared_secret_buf[MLKEM_SHARED_SECRET_BYTES];
++	uint8_t ciphertext_buf[MLKEM768_CIPHERTEXT_BYTES];
++	CBS public_key_cbs;
++	int failed = 1;
++
++	if (!CBB_finish(entropy_cbb, &entropy, &entropy_len))
++		goto err;
++	if (!CBB_finish(pubkey, &public_key, &public_key_len))
++		goto err;
++	if (!CBB_finish(ciphertext_cbb, &ciphertext, &ciphertext_len))
++		goto err;
++	if (!CBB_finish(shared_secret_cbb, &shared_secret, &shared_secret_len))
++		goto err;
++
++	CBS_init(&public_key_cbs, public_key, public_key_len);
++
++	if (!MLKEM768_parse_public_key(&pub, &public_key_cbs)) {
++		if ((failed = !should_fail))
++			warnx("#%zu: parse_public_key", line);
++		goto err;
++	}
++	MLKEM768_encap_external_entropy(ciphertext_buf, shared_secret_buf,
++	    &pub, entropy);
+ 
+-	parse_ok = MLKEM768_parse_public_key(&pub, public_key);
+-	if (!parse_ok) {
+-		TEST(!should_fail, "parse_public_key");
+-		return;
++	failed = compare_data(shared_secret, shared_secret_buf,
++	    MLKEM_SHARED_SECRET_BYTES, line, "shared_secret");
++	failed |= compare_data(ciphertext, ciphertext_buf,
++	    MLKEM768_CIPHERTEXT_BYTES, line, "ciphertext");
++
++	if (should_fail != failed) {
++		warnx("FAIL: #%zu: should_fail %d, failed %d",
++		    line, should_fail, failed);
++		failed = 1;
+ 	}
+-	MLKEM768_encap(ciphertext, shared_secret, &pub);
+-	TEST_DATAEQ(shared_secret, CBS_data(expected_shared_secret),
+-	    MLKEM_SHARED_SECRET_BYTES, "shared_secret");
+-	TEST_DATAEQ(ciphertext, CBS_data(expected_ciphertext),
+-	    MLKEM768_CIPHERTEXT_BYTES, "shared_secret");
++
++ err:
++	CBB_cleanup(entropy_cbb);
++	CBB_cleanup(pubkey);
++	CBB_cleanup(ciphertext_cbb);
++	CBB_cleanup(shared_secret_cbb);
++	freezero(entropy, entropy_len);
++	freezero(public_key, public_key_len);
++	freezero(ciphertext, ciphertext_len);
++	freezero(shared_secret, shared_secret_len);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_COMMENT 1
+-#define S_ENTROPY 2
+-#define S_PUBLIC_KEY 3
+-#define S_RESULT 4
+-#define S_CIPHERTEXT 5
+-#define S_SHARED_SECRET  6
++#define S_START			0
++#define S_COMMENT		1
++#define S_ENTROPY		2
++#define S_PUBLIC_KEY		3
++#define S_RESULT		4
++#define S_CIPHERTEXT		5
++#define S_SHARED_SECRET		6
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_COMMENT);
++	S2S(S_ENTROPY);
++	S2S(S_PUBLIC_KEY);
++	S2S(S_RESULT);
++	S2S(S_CIPHERTEXT);
++	S2S(S_SHARED_SECRET);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS entropy, public_key, ciphertext, shared_secret;
+-	const uint8_t *p = NULL;
++	CBB entropy = { 0 }, public_key = { 0 }, ciphertext = { 0 }, shared_secret = { 0 };
+ 	int should_fail = 0;
+-	char *buf;
++	const char *test;
++	size_t line;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++	line = 0;
++
++	fprintf(stderr, "Testing encap test vectors in %s\n", test);
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
+ 
+-	fprintf(stderr, "Testing encap test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+ 	state = S_COMMENT;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
++	line = 0;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
++
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
+ 			state = S_COMMENT;
+ 			break;
+ 		case S_COMMENT:
+-			if (strncmp(buf, "#", 1) != 0)
+-				break;
++			if (!CBS_get_u8(&cbs, &u8))
++				errx(1, "#%zu %s: CBB_get_u8", line, msg);
++			assert(u8 == '#');
++			if (!CBS_skip(&cbs, CBS_len(&cbs)))
++				errx(1, "#%zu %s: CBB_skip", line, msg);
+ 			state = S_ENTROPY;
+ 			break;
+ 		case S_ENTROPY:
+-			if (strncmp(buf, "entropy: ", strlen("entropy: ")) != 0)
+-				break;
+-			grab_data(&entropy, buf, strlen("entropy: "));
+-			p = CBS_data(&entropy);
++			if (!get_string_cbs(&cbs, "entropy: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &entropy, line, msg);
+ 			state = S_PUBLIC_KEY;
+ 			break;
+ 		case S_PUBLIC_KEY:
+-			if (strncmp(buf, "public_key: ",
+-			    strlen("public_key: ")) != 0)
+-				break;
+-			grab_data(&public_key, buf, strlen("public_key: "));
+-			p = CBS_data(&public_key);
++			if (!get_string_cbs(&cbs, "public_key = ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &public_key, line, msg);
+ 			state = S_RESULT;
+ 			break;
+ 		case S_RESULT:
+-			if (strncmp(buf, "result: pass",
+-			    strlen("result: pass")) != 0)
+-				should_fail = 1;
+-			else
+-				should_fail = 0;
++			if (!get_string_cbs(&cbs, "result: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			should_fail = get_string_cbs(&cbs, "fail", line, msg);
+ 			state = S_CIPHERTEXT;
+ 			break;
+ 		case S_CIPHERTEXT:
+-			if (strncmp(buf, "ciphertext: ",
+-			    strlen("ciphertext: ")) != 0)
+-				break;
+-			grab_data(&ciphertext, buf, strlen("ciphertext: "));
+-			state = S_RESULT;
++			if (!get_string_cbs(&cbs, "ciphertext: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &ciphertext, line, msg);
++			state = S_SHARED_SECRET;
+ 			break;
+ 		case S_SHARED_SECRET:
+-			if (strncmp(buf, "shared_secret: ",
+-			    strlen("shared_secret: ")) != 0)
+-				break;
+-			grab_data(&shared_secret, buf,
+-			    strlen("shared_secret: "));
+-			MlkemEncapFileTest(&entropy, &public_key, &ciphertext,
+-			    &shared_secret, should_fail);
+-			free((void *)CBS_data(&ciphertext));
+-			free((void *)CBS_data(&shared_secret));
+-			free((void *)p);
++			if (!get_string_cbs(&cbs, "shared_secret: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &shared_secret, line, msg);
++
++			failed |= MlkemEncapTest(&entropy, &public_key,
++			    &ciphertext, &shared_secret, should_fail, line);
+ 
+-			test_number++;
+ 			state = S_START;
+ 			break;
+ 		}
++		if (CBS_len(&cbs) > 0)
++			errx(1, "#%zu %s: CBS_len", line, msg);
+ 	}
+-
+ 	free(buf);
+-	exit(failure);
++
++	if (ferror(fp))
++		err(1, NULL);
++	fclose(fp);
++
++	return failed;
+ }
+--- tests/mlkem768_iteration_test.c.orig	2024-12-19 21:44:12.960518641 +0100
++++ tests/mlkem768_iteration_test.c	2024-12-19 21:44:24.763511818 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem768_iteration_test.c,v 1.2 2024/12/14 19:16:24 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,7 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -27,21 +29,6 @@
+ #include "mlkem_tests_util.h"
+ #include "sha3_internal.h"
+ 
+-static int
+-encode_private_key(const struct MLKEM768_private_key *priv, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM768_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM768_marshal_private_key(&cbb, priv))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+ /*
+  * The structure of this test is taken from
+  *  https://github.com/C2SP/CCTV/blob/main/ML-KEM/README.md?ref=words.filippo.io#accumulated-pq-crystals-vectors
+@@ -52,8 +39,8 @@ encode_private_key(const struct MLKEM768
+  * (The RNG stream starts with 7f9c2ba4e88f827d616045507605853e.)
+  */
+ 
+-static void
+-MlkemIterativeTest()
++static int
++MlkemIterativeTest(void)
+ {
+ 	/* https://github.com/C2SP/CCTV/tree/main/ML-KEM */
+ 	/*
+@@ -64,6 +51,7 @@ MlkemIterativeTest()
+ 		0x7f, 0x9c, 0x2b, 0xa4, 0xe8, 0x8f, 0x82, 0x7d, 0x61, 0x60, 0x45,
+ 		0x50, 0x76, 0x05, 0x85, 0x3e
+ 	};
++
+ 	/*
+ 	 * Filippo says:
+ 	 * ML-KEM-768: f7db260e1137a742e05fe0db9525012812b004d29040a5b606aad3d134b548d3
+@@ -100,8 +88,9 @@ MlkemIterativeTest()
+ 		 */
+ 		shake_out(&drng, seed, sizeof(seed));
+ 		if (i == 0) {
+-			TEST_DATAEQ(seed, kExpectedSeedStart,
+-			    sizeof(kExpectedSeedStart), "seed start");
++			if (compare_data(seed, kExpectedSeedStart,
++			    sizeof(kExpectedSeedStart), 0, "seed start") != 0)
++				errx(1, "compare_data");
+ 		}
+ 
+ 		/* generate ek as encoded_public_key */
+@@ -114,8 +103,9 @@ MlkemIterativeTest()
+ 		    sizeof(encoded_public_key));
+ 
+ 		/* marshal priv to dk as encoded_private_key */
+-		TEST(!encode_private_key(&priv, &encoded_private_key,
+-		    &encoded_private_key_len), "encode_private_key");
++		if (!mlkem768_encode_private_key(&priv, &encoded_private_key,
++		    &encoded_private_key_len))
++			errx(1, "mlkem768_encode_private_key");
+ 
+ 		/* hash in dk */
+ 		shake_update(&results, encoded_private_key,
+@@ -140,21 +130,21 @@ MlkemIterativeTest()
+ 		    sizeof(invalid_ciphertext));
+ 
+ 		/* generte k as shared secret from invalid ciphertext */
+-		TEST(!MLKEM768_decap(shared_secret, invalid_ciphertext,
+-		    sizeof(invalid_ciphertext), &priv), "decap failed!");
++		if (!MLKEM768_decap(shared_secret, invalid_ciphertext,
++		    sizeof(invalid_ciphertext), &priv))
++			errx(1, "decap failed");
+ 
+ 		/* hash in k */
+ 		shake_update(&results, shared_secret, sizeof(shared_secret));
+ 	}
+ 	shake_xof(&results);
+-	shake_out(&results, out, 32);
++	shake_out(&results, out, sizeof(out));
+ 
+-	TEST_DATAEQ(out, kExpectedAdam, 32, "final result hash");
++	return compare_data(kExpectedAdam, out, sizeof(out), i, "final result hash");
+ }
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	MlkemIterativeTest();
+-	exit(failure);
++	return MlkemIterativeTest();
+ }
+--- tests/mlkem768_keygen_tests.c.orig	2024-12-19 21:44:12.960518641 +0100
++++ tests/mlkem768_keygen_tests.c	2024-12-19 21:44:24.763511818 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem768_keygen_tests.c,v 1.4 2024/12/17 07:20:10 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -28,103 +31,163 @@
+ #include "mlkem_tests_util.h"
+ 
+ static int
+-encode_private_key(const struct MLKEM768_private_key *priv, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM768_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM768_marshal_private_key(&cbb, priv))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+-static void
+-MlkemKeygenFileTest(CBS *seed, CBS *public_key, CBS *private_key)
++MlkemKeygenTest(CBB *seed_cbb, CBB *public_key_cbb, CBB *private_key_cbb,
++    size_t line)
+ {
+ 	struct MLKEM768_private_key priv;
++	uint8_t *seed = NULL, *public_key = NULL, *private_key = NULL;
++	size_t seed_len = 0, public_key_len = 0, private_key_len = 0;
+ 	uint8_t *encoded_private_key = NULL;
+ 	uint8_t encoded_public_key[MLKEM768_PUBLIC_KEY_BYTES];
+ 	size_t len;
++	int failed = 1;
++
++	if (!CBB_finish(seed_cbb, &seed, &seed_len))
++		goto err;
++	if (!compare_length(MLKEM_SEED_BYTES, seed_len, line, "seed length"))
++		goto err;
++	if (!CBB_finish(public_key_cbb, &public_key, &public_key_len))
++		goto err;
++	if (!compare_length(MLKEM768_PUBLIC_KEY_BYTES, public_key_len, line,
++	    "public key length"))
++		goto err;
++	if (!CBB_finish(private_key_cbb, &private_key, &private_key_len))
++		goto err;
++	if (!compare_length(MLKEM768_PUBLIC_KEY_BYTES, public_key_len, line,
++	    "public key length"))
++		goto err;
+ 
+-	TEST(CBS_len(seed) != MLKEM_SEED_BYTES, "seed len bogus");
+-	TEST(CBS_len(private_key) != MLKEM768_PRIVATE_KEY_BYTES,
+-	    "expected private key len bogus");
+-	TEST(CBS_len(public_key) != MLKEM768_PUBLIC_KEY_BYTES,
+-	    "expected public key len bogus");
+ 	MLKEM768_generate_key_external_entropy(encoded_public_key, &priv,
+-	    CBS_data(seed));
+-	TEST(!encode_private_key(&priv, &encoded_private_key,
+-	    &len), "encode_private_key");
+-	TEST(len != MLKEM768_PRIVATE_KEY_BYTES, "private key len bogus");
+-	TEST_DATAEQ(encoded_public_key, CBS_data(public_key),
+-	    MLKEM768_PUBLIC_KEY_BYTES, "public key");
+-	TEST_DATAEQ(encoded_private_key, CBS_data(private_key),
+-	    MLKEM768_PRIVATE_KEY_BYTES, "private key");
++	    seed);
++	if (!mlkem768_encode_private_key(&priv, &encoded_private_key, &len)) {
++		warnx("#%zu: encoded_private_key", line);
++		goto err;
++	}
++
++	if (!compare_length(MLKEM768_PRIVATE_KEY_BYTES, len, line,
++	    "private key length"))
++		goto err;
++
++	failed = compare_data(private_key, encoded_private_key,
++	    MLKEM768_PRIVATE_KEY_BYTES, line, "private key");
++	failed |= compare_data(public_key, encoded_public_key,
++	    MLKEM768_PUBLIC_KEY_BYTES, line, "public key");
++
++ err:
++	CBB_cleanup(seed_cbb);
++	CBB_cleanup(public_key_cbb);
++	CBB_cleanup(private_key_cbb);
++	freezero(seed, seed_len);
++	freezero(public_key, public_key_len);
++	freezero(private_key, private_key_len);
+ 	free(encoded_private_key);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_SEED 1
+-#define S_PUBLIC_KEY  2
+-#define S_PRIVATE_KEY	3
++#define S_START		0
++#define S_COMMENT	1
++#define S_SEED		2
++#define S_PUBLIC_KEY	3
++#define S_PRIVATE_KEY	4
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_COMMENT);
++	S2S(S_SEED);
++	S2S(S_PUBLIC_KEY);
++	S2S(S_PRIVATE_KEY);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS seed, public_key, private_key;
+-	char *buf;
++	CBB seed = { 0 }, public_key = { 0 }, private_key = { 0 };
++	const char *test;
++	size_t line = 0;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++
++	fprintf(stderr, "Testing keygen test vectors in %s\n", test);
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
++
++	state = S_COMMENT;
++	line = 0;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
+ 
+-	fprintf(stderr, "Testing keygen test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+-	state = S_SEED;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
++			state = S_COMMENT;
++			break;
++		case S_COMMENT:
++			if (!CBS_get_u8(&cbs, &u8))
++				errx(1, "#%zu %s: CBB_get_u8", line, msg);
++			assert(u8 == '#');
++			if (!CBS_skip(&cbs, CBS_len(&cbs)))
++				errx(1, "#%zu %s: CBB_skip", line, msg);
+ 			state = S_SEED;
+ 			break;
+ 		case S_SEED:
+-			if (strncmp(buf, "seed: ", strlen("seed: ")) != 0) {
+-				break;
+-			}
+-			grab_data(&seed, buf, strlen("seed: "));
++			if (!get_string_cbs(&cbs, "seed: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &seed, line, msg);
+ 			state = S_PUBLIC_KEY;
+ 			break;
+ 		case S_PUBLIC_KEY:
+-			if (strncmp(buf, "public_key: ",
+-			    strlen("public_key: ")) != 0)
+-				break;
+-			grab_data(&public_key, buf, strlen("public_key: "));
++			if (!get_string_cbs(&cbs, "public_key: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &public_key, line, msg);
+ 			state = S_PRIVATE_KEY;
+ 			break;
+ 		case S_PRIVATE_KEY:
+-			if (strncmp(buf, "private_key: ",
+-			    strlen("private_key: ")) != 0)
+-				break;
+-			grab_data(&private_key, buf, strlen("private_key: "));
+-			state = S_START;
++			if (!get_string_cbs(&cbs, "private_key: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &private_key, line, msg);
+ 
+-			MlkemKeygenFileTest(&seed, &public_key, &private_key);
+-			free((void *)CBS_data(&seed));
+-			free((void *)CBS_data(&public_key));
+-			free((void *)CBS_data(&private_key));
++			failed |= MlkemKeygenTest(&seed, &public_key,
++			    &private_key, line);
+ 
+-			test_number++;
+ 			state = S_START;
+ 			break;
+ 		}
++		if (CBS_len(&cbs) > 0)
++			errx(1, "#%zu %s: CBS_len", line, msg);
+ 	}
+-
+ 	free(buf);
++
++	if (ferror(fp))
++		err(1, NULL);
+ 	fclose(fp);
+-	exit(failure);
++
++	return failed;
+ }
+--- tests/mlkem768_nist_decap_tests.c.orig	2024-12-19 21:44:12.961518640 +0100
++++ tests/mlkem768_nist_decap_tests.c	2024-12-19 21:44:24.764511818 +0100
+@@ -16,6 +16,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -27,85 +29,165 @@
+ #include "mlkem_internal.h"
+ #include "mlkem_tests_util.h"
+ 
+-static void
+-MlkemNistDecapFileTest(CBS *c, CBS *k, CBS *dk)
++static int
++MlkemNistDecapFileTest(CBB *c_cbb, CBB *k_cbb, CBS *dk, size_t line)
+ {
++	uint8_t *c = NULL, *k = NULL;
++	size_t c_len = 0, k_len = 0;
+ 	uint8_t shared_secret[MLKEM_SHARED_SECRET_BYTES];
+ 	struct MLKEM768_private_key priv;
++	int failed = 1;
+ 
+-	TEST(CBS_len(dk) != MLKEM768_PRIVATE_KEY_BYTES,
+-	    "private key len bogus");
+-	TEST(CBS_len(k) != MLKEM_SHARED_SECRET_BYTES,
+-	    "shared secret len bogus");
+-
+-	TEST(!MLKEM768_parse_private_key(&priv, dk), "parse_private_key");
+-	TEST(!MLKEM768_decap(shared_secret, CBS_data(c), CBS_len(c), &priv),
+-	    "decap");
+-	TEST_DATAEQ(shared_secret, CBS_data(k),
+-	    MLKEM_SHARED_SECRET_BYTES, "shared_secret");
++	if (!CBB_finish(c_cbb, &c, &c_len))
++		goto err;
++	if (!CBB_finish(k_cbb, &k, &k_len))
++		goto err;
++
++	if (!compare_length(MLKEM768_PRIVATE_KEY_BYTES, CBS_len(dk), line,
++	    "private key len bogus"))
++		goto err;
++	if (!compare_length(MLKEM_SHARED_SECRET_BYTES, k_len, line,
++	    "shared secret len bogus"))
++		goto err;
++
++	if (!MLKEM768_parse_private_key(&priv, dk)) {
++		warnx("#%zu MLKEM768_parse_private_key", line);
++		goto err;
++	}
++	if (!MLKEM768_decap(shared_secret, c, c_len, &priv)) {
++		warnx("#%zu MLKEM768_decap", line);
++		goto err;
++	}
++
++	failed = compare_data(shared_secret, k, k_len, line, "shared_secret");
++
++ err:
++	CBB_cleanup(c_cbb);
++	CBB_cleanup(k_cbb);
++	freezero(c, c_len);
++	freezero(k, k_len);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_CIPHERTEXT 1
+-#define S_SHARED_SECRET  2
+-#define S_PRIVATE_KEY 3
++#define S_START		0
++#define S_C		1
++#define S_K		2
++#define S_EMPTY		3
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_C);
++	S2S(S_K);
++	S2S(S_EMPTY);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS ciphertext, shared_secret, private_key;
+-	const uint8_t *p;
+-	char *buf;
++	CBB dk_cbb = { 0 }, c = { 0 }, k = { 0 };
++	CBS instr;
++	uint8_t *dk = NULL;
++	size_t dk_len = 0;
++	uint8_t bracket, newline;
++	const char *test;
++	size_t line;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
++
++	if ((len = getline(&buf, &buflen, fp)) == -1)
++		err(1, "failed to read instruction line");
++
++	/*
++	 * The private key is enclosed in brackets in an "instruction line".
++	 */
++	line = 1;
++	CBS_init(&instr, buf, len);
++	if (!CBS_get_u8(&instr, &bracket))
++		err(1, "failed to parse instruction line '['");
++	assert(bracket == '[');
++	if (!CBS_get_last_u8(&instr, &newline))
++		errx(1, "failed to parse instruction line '\\n'");
++	assert(newline == '\n');
++	if (!CBS_get_last_u8(&instr, &bracket))
++		errx(1, "failed to parse instruction line ']'");
++	assert(bracket == ']');
++	if (!get_string_cbs(&instr, "dk: ", line, "private key"))
++		errx(1, "failed to read instruction line 'dk: '");
++	hex_decode_cbs(&instr, &dk_cbb, line, "private key");
++	assert(CBS_len(&instr) == 0);
++
++	if (!CBB_finish(&dk_cbb, &dk, &dk_len))
++		errx(1, "CBB finish instruction line");
++
++	state = S_START;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs, dk_cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
+ 
+-	fprintf(stderr, "Testing NIST decap test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+-	state = S_CIPHERTEXT;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
+-			state = S_CIPHERTEXT;
++			state = S_C;
+ 			break;
+-		case S_CIPHERTEXT:
+-			if (strncmp(buf, "ciphertext: ",
+-			    strlen("ciphertext: ")) != 0) {
+-				break;
+-			}
+-			grab_data(&ciphertext, buf, strlen("ciphertext: "));
+-			state = S_SHARED_SECRET;
++		case S_C:
++			if (!get_string_cbs(&cbs, "c: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &c, line, msg);
++			state = S_K;
+ 			break;
+-		case S_SHARED_SECRET:
+-			if (strncmp(buf, "shared_secret: ",
+-			    strlen("shared_secret: ")) != 0)
+-				break;
+-			grab_data(&shared_secret, buf,
+-			    strlen("shared_secret: "));
+-			state = S_PRIVATE_KEY;
++		case S_K:
++			if (!get_string_cbs(&cbs, "k: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &k, line, msg);
++			state = S_EMPTY;
+ 			break;
+-		case S_PRIVATE_KEY:
+-			if (strncmp(buf, "private_key: ",
+-			    strlen("private_key: ")) != 0)
+-				break;
+-			grab_data(&private_key, buf, strlen("private_key: "));
+-			p = CBS_data(&private_key);
+-
+-			MlkemNistDecapFileTest(&ciphertext, &shared_secret,
+-			    &private_key);
+-			free((void *)CBS_data(&ciphertext));
+-			free((void *)CBS_data(&shared_secret));
+-			free((void *)p);
++		case S_EMPTY:
++			CBS_init(&dk_cbs, dk, dk_len);
++
++			failed |= MlkemNistDecapFileTest(&c, &k, &dk_cbs, line);
+ 
+-			state = S_START;
+-			test_number++;
++			state = S_C;
+ 			break;
+ 		}
++		if (CBS_len(&cbs) > 0)
++			errx(1, "#%zu %s: CBS_len", line, msg);
+ 	}
+-
+ 	free(buf);
+-	exit(failure);
++
++	if (ferror(fp))
++		err(1, NULL);
++	fclose(fp);
++
++	freezero(dk, dk_len);
++
++	return failed;
+ }
+--- tests/mlkem768_nist_keygen_tests.c.orig	2024-12-19 21:44:12.961518640 +0100
++++ tests/mlkem768_nist_keygen_tests.c	2024-12-19 21:44:24.764511818 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem768_nist_keygen_tests.c,v 1.3 2024/12/17 07:20:10 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -16,6 +17,8 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <assert.h>
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -28,111 +31,170 @@
+ #include "mlkem_tests_util.h"
+ 
+ static int
+-encode_private_key(const struct MLKEM768_private_key *priv, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM768_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM768_marshal_private_key(&cbb, priv))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+-static void
+-MlkemNistKeygenFileTest(CBS *z, CBS *d, CBS *ek, CBS *dk)
++MlkemNistKeygenTest(CBB *z_cbb, CBB *d_cbb, CBB *ek_cbb, CBB *dk_cbb,
++    size_t line)
+ {
++	CBB seed_cbb;
++	uint8_t *z = NULL, *d = NULL, *ek = NULL, *dk = NULL;
++	size_t z_len = 0, d_len = 0, ek_len = 0, dk_len = 0;
+ 	uint8_t seed[MLKEM_SEED_BYTES];
+ 	struct MLKEM768_private_key priv;
+ 	uint8_t *encoded_private_key = NULL;
+ 	uint8_t encoded_public_key[MLKEM768_PUBLIC_KEY_BYTES];
+ 	size_t len;
++	int failed = 1;
++
++	if (!CBB_init_fixed(&seed_cbb, seed, sizeof(seed)))
++		goto err;
++
++	if (!CBB_finish(z_cbb, &z, &z_len))
++		goto err;
++	if (!CBB_finish(d_cbb, &d, &d_len))
++		goto err;
++	if (!CBB_finish(ek_cbb, &ek, &ek_len))
++		goto err;
++	if (!CBB_finish(dk_cbb, &dk, &dk_len))
++		goto err;
++
++	if (!CBB_add_bytes(&seed_cbb, d, d_len))
++		goto err;
++	if (!CBB_add_bytes(&seed_cbb, z, z_len))
++		goto err;
++	if (!CBB_finish(&seed_cbb, NULL, &len))
++		goto err;
++
++	if (!compare_length(MLKEM_SEED_BYTES, len, line, "z or d length bogus"))
++		goto err;
+ 
+-	TEST(CBS_len(d) != (MLKEM_SEED_BYTES / 2), "d len bogus");
+-	TEST(CBS_len(z) != (MLKEM_SEED_BYTES / 2), "z len bogus");
+-	TEST(CBS_len(dk) != MLKEM768_PRIVATE_KEY_BYTES,
+-	    "expected private key len bogus");
+-	TEST(CBS_len(ek) != MLKEM768_PUBLIC_KEY_BYTES,
+-	    "expected public key len bogus");
+-	memcpy(&seed[0], CBS_data(d), CBS_len(d));
+-	memcpy(&seed[MLKEM_SEED_BYTES / 2], CBS_data(z), CBS_len(z));
+ 	MLKEM768_generate_key_external_entropy(encoded_public_key, &priv, seed);
+-	TEST(!encode_private_key(&priv, &encoded_private_key,
+-	    &len), "encode_private_key");
+-	TEST(len != MLKEM768_PRIVATE_KEY_BYTES, "private key len bogus");
+-	TEST_DATAEQ(encoded_public_key, CBS_data(ek),
+-	    MLKEM768_PUBLIC_KEY_BYTES, "public key");
+-	TEST_DATAEQ(encoded_private_key, CBS_data(dk),
+-	    MLKEM768_PRIVATE_KEY_BYTES, "private key");
++
++	if (!mlkem768_encode_private_key(&priv, &encoded_private_key, &len)) {
++		warnx("#%zu mlkem768_encode_private_key", line);
++		goto err;
++	}
++
++	if (!compare_length(MLKEM768_PRIVATE_KEY_BYTES, len, line,
++	    "private key length"))
++		goto err;
++
++	failed = compare_data(ek, encoded_public_key, MLKEM768_PUBLIC_KEY_BYTES,
++	    line, "public key");
++	failed |= compare_data(dk, encoded_private_key, MLKEM768_PRIVATE_KEY_BYTES,
++	    line, "private key");
++
++ err:
++	CBB_cleanup(&seed_cbb);
++	CBB_cleanup(z_cbb);
++	CBB_cleanup(d_cbb);
++	CBB_cleanup(ek_cbb);
++	CBB_cleanup(dk_cbb);
++	freezero(z, z_len);
++	freezero(d, d_len);
++	freezero(ek, ek_len);
++	freezero(dk, dk_len);
+ 	free(encoded_private_key);
++
++	return failed;
+ }
+ 
+-#define S_START 0
+-#define S_Z 1
+-#define S_D  2
+-#define S_EK	3
+-#define S_DK	4
++#define S_START		0
++#define S_Z		1
++#define S_D		2
++#define S_EK		3
++#define S_DK		4
++
++#define S2S(x) case x: return #x
++
++static const char *
++state2str(int state)
++{
++	switch (state) {
++	S2S(S_START);
++	S2S(S_Z);
++	S2S(S_D);
++	S2S(S_EK);
++	S2S(S_DK);
++	default:
++		errx(1, "unknown state %d", state);
++	}
++}
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	CBS z, d, ek, dk;
+-	char *buf;
++	CBB z = { 0 }, d = { 0 }, ek = { 0 }, dk = { 0 };
++	const char *test;
++	size_t line = 0;
++	char *buf = NULL;
++	size_t buflen = 0;
++	ssize_t len;
+ 	FILE *fp;
+ 	int state;
++	int failed = 0;
++
++	if (argc < 2)
++		errx(1, "%s: missing test file", argv[0]);
++
++	test = argv[1];
++
++	fprintf(stderr, "Testing NIST keygen test vectors in %s\n", test);
++
++	if ((fp = fopen(test, "r")) == NULL)
++		err(1, "cant't open test file");
+ 
+-	fprintf(stderr, "Testing NIST keygen test vectors in %s\n", argv[1]);
+-	TEST((fp = fopen(argv[1], "r")) == NULL, "can't open test file");
+-	MALLOC(buf, 16*1024);
+ 	state = S_Z;
+-	test_number = 1;
+-	while (fgets(buf, 16*1024, fp) != NULL) {
++	line = 0;
++
++	while ((len = getline(&buf, &buflen, fp)) != -1) {
++		const char *msg = state2str(state);
++		CBS cbs;
++		uint8_t u8;
++
++		line++;
++		CBS_init(&cbs, buf, len);
++
++		if (!CBS_get_last_u8(&cbs, &u8))
++			errx(1, "#%zu %s: CBB_get_last_u8", line, msg);
++		assert(u8 == '\n');
++
+ 		switch (state) {
+ 		case S_START:
+-			if (strcmp(buf, "\n") != 0)
+-				break;
+ 			state = S_Z;
+ 			break;
+ 		case S_Z:
+-			if (strncmp(buf, "z: ", strlen("z: ")) != 0) {
+-				break;
+-			}
+-			grab_data(&z, buf, strlen("z: "));
++			if (!get_string_cbs(&cbs, "z: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &z, line, msg);
+ 			state = S_D;
+ 			break;
+ 		case S_D:
+-			if (strncmp(buf, "d: ", strlen("d: ")) != 0)
+-				break;
+-			grab_data(&d, buf, strlen("d: "));
++			if (!get_string_cbs(&cbs, "d: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &d, line, msg);
+ 			state = S_EK;
+ 			break;
+ 		case S_EK:
+-			if (strncmp(buf, "ek: ", strlen("ek: ")) != 0)
+-				break;
+-			grab_data(&ek, buf, strlen("ek: "));
++			if (!get_string_cbs(&cbs, "ek: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &ek, line, msg);
+ 			state = S_DK;
+ 			break;
+ 		case S_DK:
+-			if (strncmp(buf, "dk: ", strlen("dk: ")) != 0)
+-				break;
+-			grab_data(&dk, buf, strlen("dk: "));
+-
+-			MlkemNistKeygenFileTest(&z, &d, &ek, &dk);
+-			free((void *)CBS_data(&z));
+-			free((void *)CBS_data(&d));
+-			free((void *)CBS_data(&ek));
+-			free((void *)CBS_data(&dk));
++			if (!get_string_cbs(&cbs, "dk: ", line, msg))
++				errx(1, "#%zu %s: get_string_cbs", line, msg);
++			hex_decode_cbs(&cbs, &dk, line, msg);
++
++			failed |= MlkemNistKeygenTest(&z, &d, &ek, &dk, line);
+ 
+-			test_number++;
+ 			state = S_START;
+ 			break;
+ 		}
+ 	}
+-
+ 	free(buf);
++
++	if (ferror(fp))
++		err(1, NULL);
+ 	fclose(fp);
+-	exit(failure);
++
++	return failed;
+ }
+--- tests/mlkem_tests_util.c.orig	2024-12-19 21:44:12.961518640 +0100
++++ tests/mlkem_tests_util.c	2024-12-19 21:44:24.764511818 +0100
+@@ -1,7 +1,8 @@
+ /*	$OpenBSD: mlkem_tests_util.c,v 1.2 2024/12/14 19:16:24 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Google Inc.
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Google Inc.
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -22,12 +23,14 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include <openssl/bytestring.h>
++
+ #include "mlkem_tests_util.h"
+ 
+ int failure;
+ int test_number;
+ 
+-void
++static void
+ hexdump(const uint8_t *buf, size_t len, const uint8_t *compare)
+ {
+ 	const char *mark = "";
+@@ -43,32 +46,171 @@ hexdump(const uint8_t *buf, size_t len,
+ }
+ 
+ int
+-hex_decode(char *buf, size_t len, uint8_t **out_buf, size_t *out_len)
++compare_data(const uint8_t *want, const uint8_t *got, size_t len, size_t line,
++    const char *msg)
+ {
+-	size_t i;
+-	if (*out_buf != NULL)
+-		abort(); /* Du hast einin rotweinflarsche... */
++	if (memcmp(want, got, len) == 0)
++		return 0;
+ 
+-	MALLOC(*out_buf, len);
+-	*out_len = 0;
++	warnx("FAIL: #%zu - %s differs", line, msg);
++	fprintf(stderr, "want:\n");
++	hexdump(want, len, got);
++	fprintf(stderr, "got:\n");
++	hexdump(got, len, want);
++	fprintf(stderr, "\n");
+ 
+-	for (i = 0; i < len; i += 2) {
+-		if (sscanf(buf + i, "%2hhx", *out_buf + *out_len) != 1)
+-			err(1, "FAIL- hex decode failed for %d\n",
+-			    (int)*out_len);
+-		(*out_len)++;
+-	}
+ 	return 1;
+ }
+ 
++int
++compare_length(size_t want, size_t got, size_t line, const char *msg)
++{
++	if (want == got)
++		return 1;
++
++	warnx("#%zu: %s: want %zu, got %zu", line, msg, want, got);
++	return 0;
++}
++
++static int
++hex_get_nibble_cbs(CBS *cbs, uint8_t *out_nibble)
++{
++	uint8_t c;
++
++	if (!CBS_get_u8(cbs, &c))
++		return 0;
++
++	if (c >= '0' && c <= '9') {
++		*out_nibble = c - '0';
++		return 1;
++	}
++	if (c >= 'a' && c <= 'f') {
++		*out_nibble = c - 'a' + 10;
++		return 1;
++	}
++	if (c >= 'A' && c <= 'F') {
++		*out_nibble = c - 'A' + 10;
++		return 1;
++	}
++
++	return 0;
++}
++
+ void
+-grab_data(CBS *cbs, char *buf, size_t offset)
++hex_decode_cbs(CBS *cbs, CBB *cbb, size_t line, const char *msg)
+ {
+-	char *start = buf + offset;
+-	size_t len = strlen(start);
+-	uint8_t *new = NULL;
+-	size_t new_len = 0;
+-	/* This is hex encoded - decode it. */
+-	TEST(!hex_decode(start, len - 1, &new, &new_len), "hex decode failed");
+-	CBS_init(cbs, new, new_len);
++	if (!CBB_init(cbb, 0))
++		errx(1, "#%zu %s: %s CBB_init", line, msg, __func__);
++
++	while (CBS_len(cbs) > 0) {
++		uint8_t hi, lo;
++
++		if (!hex_get_nibble_cbs(cbs, &hi))
++			errx(1, "#%zu %s: %s nibble", line, msg, __func__);
++		if (!hex_get_nibble_cbs(cbs, &lo))
++			errx(1, "#%zu %s: %s nibble", line, msg, __func__);
++
++		if (!CBB_add_u8(cbb, hi << 4 | lo))
++			errx(1, "#%zu %s: %s CBB_add_u8", line, msg, __func__);
++	}
++}
++
++int
++get_string_cbs(CBS *cbs_in, const char *str, size_t line, const char *msg)
++{
++	CBS cbs;
++	size_t len = strlen(str);
++
++	if (!CBS_get_bytes(cbs_in, &cbs, len))
++		errx(1, "#%zu %s: %s CBB_get_bytes", line, msg, __func__);
++
++	return CBS_mem_equal(&cbs, str, len);
++}
++
++int
++mlkem768_encode_private_key(const struct MLKEM768_private_key *priv,
++    uint8_t **out_buf, size_t *out_len)
++{
++	CBB cbb;
++	int ret = 0;
++
++	if (!CBB_init(&cbb, MLKEM768_PUBLIC_KEY_BYTES))
++		goto err;
++	if (!MLKEM768_marshal_private_key(&cbb, priv))
++		goto err;
++	if (!CBB_finish(&cbb, out_buf, out_len))
++		goto err;
++
++	ret = 1;
++
++ err:
++	CBB_cleanup(&cbb);
++
++	return ret;
++}
++
++int
++mlkem768_encode_public_key(const struct MLKEM768_public_key *pub,
++    uint8_t **out_buf, size_t *out_len)
++{
++	CBB cbb;
++	int ret = 0;
++
++	if (!CBB_init(&cbb, MLKEM768_PUBLIC_KEY_BYTES))
++		goto err;
++	if (!MLKEM768_marshal_public_key(&cbb, pub))
++		goto err;
++	if (!CBB_finish(&cbb, out_buf, out_len))
++		goto err;
++
++	ret = 1;
++
++ err:
++	CBB_cleanup(&cbb);
++
++	return ret;
++}
++
++int
++mlkem1024_encode_private_key(const struct MLKEM1024_private_key *priv,
++    uint8_t **out_buf, size_t *out_len)
++{
++	CBB cbb;
++	int ret = 0;
++
++	if (!CBB_init(&cbb, MLKEM1024_PUBLIC_KEY_BYTES))
++		goto err;
++	if (!MLKEM1024_marshal_private_key(&cbb, priv))
++		goto err;
++	if (!CBB_finish(&cbb, out_buf, out_len))
++		goto err;
++
++	ret = 1;
++
++ err:
++	CBB_cleanup(&cbb);
++
++	return ret;
++}
++
++int
++mlkem1024_encode_public_key(const struct MLKEM1024_public_key *pub,
++    uint8_t **out_buf, size_t *out_len)
++{
++	CBB cbb;
++	int ret = 0;
++
++	if (!CBB_init(&cbb, MLKEM1024_PUBLIC_KEY_BYTES))
++		goto err;
++	if (!MLKEM1024_marshal_public_key(&cbb, pub))
++		goto err;
++	if (!CBB_finish(&cbb, out_buf, out_len))
++		goto err;
++
++	ret = 1;
++
++ err:
++	CBB_cleanup(&cbb);
++
++	return ret;
+ }
+--- tests/mlkem_tests_util.h.orig	2024-12-19 21:44:12.961518640 +0100
++++ tests/mlkem_tests_util.h	2024-12-19 21:44:24.765511817 +0100
+@@ -1,6 +1,7 @@
+ /*	$OpenBSD: mlkem_tests_util.h,v 1.2 2024/12/14 19:16:24 tb Exp $ */
+ /*
+- * Copyright (c) 2024, Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Bob Beck <beck@obtuse.com>
++ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -19,46 +20,24 @@
+ #define MLKEM_TEST_UTIL_H
+ 
+ #include <stdint.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+ 
+ #include <openssl/bytestring.h>
+ 
+-#define TEST(cond, msg) do {						\
+-	if ((cond)) {							\
+-		failure = 1;						\
+-		fprintf(stderr, "FAIL: %s:%d - Test %d: %s\n",		\
+-		    __FILE__, __LINE__, test_number, msg);		\
+-	}								\
+-} while(0)
+-
+-#define MALLOC(A, B) do {						\
+-	if (((A) = malloc(B)) == NULL) {				\
+-		failure = 1;						\
+-		fprintf(stderr, "FAIL: %s:%d - Test %d: malloc\n",	\
+-		    __FILE__, __LINE__, test_number);			\
+-		exit(1);						\
+-	}								\
+-} while(0)
+-
+-#define TEST_DATAEQ(values, expected, len, msg) do {			\
+-	if (memcmp((values), (expected), (len)) != 0) {			\
+-		failure = 1;						\
+-		fprintf(stderr, "FAIL: %s:%d - Test %d: %s differs\n",	\
+-		    __FILE__, __LINE__, test_number, msg);		\
+-		fprintf(stderr, "values:\n");				\
+-		hexdump(values, len, expected);				\
+-		fprintf(stderr, "expected:\n");				\
+-		hexdump(expected, len, values);				\
+-		fprintf(stderr, "\n");					\
+-	}								\
+-} while(0)
+-
+-extern int failure, test_number;
+-
+-void hexdump(const uint8_t *buf, size_t len, const uint8_t *compare);
+-int hex_decode(char *buf, size_t len, uint8_t **out_buf, size_t *out_len);
+-void grab_data(CBS *cbs, char *buf, size_t offset);
++#include "mlkem_internal.h"
+ 
+-#endif
++int compare_data(const uint8_t *want, const uint8_t *got, size_t len,
++    size_t line, const char *msg);
++int compare_length(size_t want, size_t got, size_t line, const char *msg);
++void hex_decode_cbs(CBS *cbs, CBB *cbb, size_t line, const char *msg);
++int get_string_cbs(CBS *cbs, const char *str, size_t line, const char *msg);
++
++int mlkem768_encode_private_key(const struct MLKEM768_private_key *priv,
++    uint8_t **out_buf, size_t *out_len);
++int mlkem768_encode_public_key(const struct MLKEM768_public_key *pub,
++    uint8_t **out_buf, size_t *out_len);
++int mlkem1024_encode_private_key(const struct MLKEM1024_private_key *priv,
++    uint8_t **out_buf, size_t *out_len);
++int mlkem1024_encode_public_key(const struct MLKEM1024_public_key *pub,
++    uint8_t **out_buf, size_t *out_len);
++
++#endif /* MLKEM_TEST_UTIL_H */
+--- tests/mlkem_unittest.c.orig	2024-12-19 21:44:12.962518640 +0100
++++ tests/mlkem_unittest.c	2024-12-19 21:44:24.765511817 +0100
+@@ -16,6 +16,7 @@
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <err.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -28,40 +29,10 @@
+ #include "mlkem_tests_util.h"
+ 
+ static int
+-encode_public_key(const struct MLKEM768_public_key *pub, uint8_t **out_buf,
+-    size_t *out_len)
++MlKem768UnitTest(void)
+ {
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM768_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM768_marshal_public_key(&cbb, pub))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+-static int
+-encode_private_key(const struct MLKEM768_private_key *priv, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM768_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM768_marshal_private_key(&cbb, priv))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+-static void
+-MlKem768UnitTest()
+-{
+-	struct MLKEM768_private_key *priv, *priv2;
+-	struct MLKEM768_public_key *pub, *pub2;
++	struct MLKEM768_private_key priv = { 0 }, priv2 = { 0 };
++	struct MLKEM768_public_key pub = { 0 }, pub2 = { 0 };
+ 	uint8_t encoded_public_key[MLKEM768_PUBLIC_KEY_BYTES];
+ 	uint8_t ciphertext[MLKEM768_CIPHERTEXT_BYTES];
+ 	uint8_t shared_secret1[MLKEM_SHARED_SECRET_BYTES];
+@@ -70,123 +41,138 @@ MlKem768UnitTest()
+ 	uint8_t *encoded_private_key = NULL, *tmp_buf = NULL;
+ 	size_t encoded_private_key_len, tmp_buf_len;
+ 	CBS cbs;
++	int failed = 0;
+ 
+-	fprintf(stderr, "ML-KEM 768...\n");
+-
+-	MALLOC(priv, sizeof(struct MLKEM768_private_key));
+-	MLKEM768_generate_key(encoded_public_key, NULL, priv);
++	MLKEM768_generate_key(encoded_public_key, NULL, &priv);
+ 
+ 	memcpy(first_two_bytes, encoded_public_key, sizeof(first_two_bytes));
+ 	memset(encoded_public_key, 0xff, sizeof(first_two_bytes));
+-	CBS_init(&cbs, encoded_public_key,
+-	    sizeof(encoded_public_key));
+-	MALLOC(pub, sizeof(struct MLKEM768_public_key));
+-	/*  Parsing should fail because the first coefficient is >= kPrime; */
+-	TEST(MLKEM768_parse_public_key(pub, &cbs),
+-	    "Kyber_parse_public_key should have failed");
++
++	CBS_init(&cbs, encoded_public_key, sizeof(encoded_public_key));
++
++	/* Parsing should fail because the first coefficient is >= kPrime. */
++	if (MLKEM768_parse_public_key(&pub, &cbs)) {
++		warnx("MLKEM768_parse_public_key should have failed");
++		failed |= 1;
++	}
+ 
+ 	memcpy(encoded_public_key, first_two_bytes, sizeof(first_two_bytes));
+ 	CBS_init(&cbs, encoded_public_key, sizeof(encoded_public_key));
+-	TEST(!MLKEM768_parse_public_key(pub, &cbs),
+-	    "MLKEM768_parse_public_key");
+-	TEST(CBS_len(&cbs) != 0u, "CBS_len must be 0");
+-
+-	TEST(!encode_public_key(pub, &tmp_buf, &tmp_buf_len),
+-	    "encode_public_key");
+-	TEST(sizeof(encoded_public_key) != tmp_buf_len,
+-	    "encoded public key lengths differ");
+-	TEST_DATAEQ(tmp_buf, encoded_public_key, tmp_buf_len,
+-	    "encoded public keys");
++	if (!MLKEM768_parse_public_key(&pub, &cbs)) {
++		warnx("MLKEM768_parse_public_key");
++		failed |= 1;
++	}
++
++	if (CBS_len(&cbs) != 0u) {
++		warnx("CBS_len must be 0");
++		failed |= 1;
++	}
++
++	if (!mlkem768_encode_public_key(&pub, &tmp_buf, &tmp_buf_len)) {
++		warnx("encode_public_key");
++		failed |= 1;
++	}
++	if (sizeof(encoded_public_key) != tmp_buf_len) {
++		warnx("mlkem768 encoded public key lengths differ");
++		failed |= 1;
++	}
++
++	if (compare_data(encoded_public_key, tmp_buf, tmp_buf_len, 768,
++	    "encoded public keys") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
+ 	free(tmp_buf);
+ 	tmp_buf = NULL;
+ 
+-	MALLOC(pub2, sizeof(struct MLKEM768_public_key));
+-	MLKEM768_public_from_private(pub2, priv);
+-	TEST(!encode_public_key(pub2, &tmp_buf, &tmp_buf_len),
+-	    "encode_public_key");
+-	TEST(sizeof(encoded_public_key) != tmp_buf_len,
+-	    "encoded public key lengths differ");
+-	TEST_DATAEQ(tmp_buf, encoded_public_key, tmp_buf_len,
+-	    "encoded pubic keys");
++	MLKEM768_public_from_private(&pub2, &priv);
++	if (!mlkem768_encode_public_key(&pub2, &tmp_buf, &tmp_buf_len)) {
++		warnx("mlkem768_encode_public_key");
++		failed |= 1;
++	}
++	if (sizeof(encoded_public_key) != tmp_buf_len) {
++		warnx("mlkem768 encoded public key lengths differ");
++		failed |= 1;
++	}
++
++	if (compare_data(encoded_public_key, tmp_buf, tmp_buf_len, 768,
++	    "encoded public keys") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
+ 	free(tmp_buf);
+ 	tmp_buf = NULL;
+ 
+-	TEST(!encode_private_key(priv, &encoded_private_key,
+-	    &encoded_private_key_len), "encode_private_key");
++	if (!mlkem768_encode_private_key(&priv, &encoded_private_key,
++	    &encoded_private_key_len)) {
++		warnx("mlkem768_encode_private_key");
++		failed |= 1;
++	}
+ 
+ 	memcpy(first_two_bytes, encoded_private_key, sizeof(first_two_bytes));
+ 	memset(encoded_private_key, 0xff, sizeof(first_two_bytes));
+ 	CBS_init(&cbs, encoded_private_key, encoded_private_key_len);
+-	MALLOC(priv2, sizeof(struct MLKEM768_private_key));
++
+ 	/*  Parsing should fail because the first coefficient is >= kPrime. */
+-	TEST(MLKEM768_parse_private_key(priv2, &cbs), "Should not have parsed");
++	if (MLKEM768_parse_private_key(&priv2, &cbs)) {
++		warnx("MLKEM768_parse_private_key should have failed");
++		failed |= 1;
++	}
+ 
+ 	memcpy(encoded_private_key, first_two_bytes, sizeof(first_two_bytes));
+ 	CBS_init(&cbs, encoded_private_key, encoded_private_key_len);
+-	TEST(!MLKEM768_parse_private_key(priv2, &cbs),
+-	    "MLKEM768_parse_private_key");
+-	TEST(!encode_private_key(priv2, &tmp_buf, &tmp_buf_len),
+-	    "encode_private_key");
+-	TEST(encoded_private_key_len != tmp_buf_len,
+-	    "encoded private key lengths differ");
+-	TEST_DATAEQ(tmp_buf, encoded_private_key, encoded_private_key_len,
+-	    "encoded private keys");
++
++	if (!MLKEM768_parse_private_key(&priv2, &cbs)) {
++		warnx("MLKEM768_parse_private_key");
++		failed |= 1;
++	}
++
++	if (!mlkem768_encode_private_key(&priv2, &tmp_buf, &tmp_buf_len)) {
++		warnx("mlkem768_encode_private_key");
++		failed |= 1;
++	}
++
++	if (encoded_private_key_len != tmp_buf_len) {
++		warnx("mlkem768 encode private key lengths differ");
++		failed |= 1;
++	}
++
++	if (compare_data(encoded_private_key, tmp_buf, tmp_buf_len, 768,
++	    "encoded private key") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
++
+ 	free(tmp_buf);
+ 	tmp_buf = NULL;
+ 
+-	MLKEM768_encap(ciphertext, shared_secret1, pub);
++	MLKEM768_encap(ciphertext, shared_secret1, &pub);
+ 	MLKEM768_decap(shared_secret2, ciphertext, MLKEM768_CIPHERTEXT_BYTES,
+-	    priv);
+-	TEST_DATAEQ(shared_secret1, shared_secret2, MLKEM_SHARED_SECRET_BYTES,
+-	    "shared secrets with priv");
++	    &priv);
++	if (compare_data(shared_secret1, shared_secret2, MLKEM_SHARED_SECRET_BYTES,
++	    768, "shared secrets with priv") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
++
+ 	MLKEM768_decap(shared_secret2, ciphertext, MLKEM768_CIPHERTEXT_BYTES,
+-	    priv2);
+-	TEST_DATAEQ(shared_secret1, shared_secret2, MLKEM_SHARED_SECRET_BYTES,
+-	    "shared secrets with priv2");
++	    &priv2);
++	if (compare_data(shared_secret1, shared_secret2, MLKEM_SHARED_SECRET_BYTES,
++	    768, "shared secrets with priv2") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
+ 
+ 	free(encoded_private_key);
+-	free(pub);
+-	free(pub2);
+-	free(priv);
+-	free(priv2);
+-
+-}
+ 
+-static int
+-encode_1024public_key(const struct MLKEM1024_public_key *pub, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM1024_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM1024_marshal_public_key(&cbb, pub))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
++	return failed;
+ }
+ 
+ static int
+-encode_1024private_key(const struct MLKEM1024_private_key *priv, uint8_t **out_buf,
+-    size_t *out_len)
+-{
+-	CBB cbb;
+-	if (!CBB_init(&cbb, MLKEM1024_PUBLIC_KEY_BYTES))
+-		return 0;
+-	if (!MLKEM1024_marshal_private_key(&cbb, priv))
+-		return 0;
+-	if (!CBB_finish(&cbb, out_buf, out_len))
+-		return 0;
+-	CBB_cleanup(&cbb);
+-	return 1;
+-}
+-
+-static void
+-MlKem1024UnitTest()
++MlKem1024UnitTest(void)
+ {
+-	struct MLKEM1024_private_key *priv, *priv2;
+-	struct MLKEM1024_public_key *pub, *pub2;
++	struct MLKEM1024_private_key priv = { 0 }, priv2 = { 0 };
++	struct MLKEM1024_public_key pub = { 0 }, pub2 = { 0 };
+ 	uint8_t encoded_public_key[MLKEM1024_PUBLIC_KEY_BYTES];
+ 	uint8_t ciphertext[MLKEM1024_CIPHERTEXT_BYTES];
+ 	uint8_t shared_secret1[MLKEM_SHARED_SECRET_BYTES];
+@@ -195,92 +181,140 @@ MlKem1024UnitTest()
+ 	uint8_t *encoded_private_key = NULL, *tmp_buf = NULL;
+ 	size_t encoded_private_key_len, tmp_buf_len;
+ 	CBS cbs;
++	int failed = 0;
+ 
+-	fprintf(stderr, "ML-KEM 1024...\n");
+-
+-	MALLOC(priv, sizeof(struct MLKEM1024_private_key));
+-	MLKEM1024_generate_key(encoded_public_key, NULL, priv);
++	MLKEM1024_generate_key(encoded_public_key, NULL, &priv);
+ 
+ 	memcpy(first_two_bytes, encoded_public_key, sizeof(first_two_bytes));
+ 	memset(encoded_public_key, 0xff, sizeof(first_two_bytes));
+-	CBS_init(&cbs, encoded_public_key,
+-	    sizeof(encoded_public_key));
+-	MALLOC(pub, sizeof(struct MLKEM1024_public_key));
+-	/*  Parsing should fail because the first coefficient is >= kPrime; */
+-	TEST(MLKEM1024_parse_public_key(pub, &cbs),
+-	    "Kyber_parse_public_key should have failed");
++
++	CBS_init(&cbs, encoded_public_key, sizeof(encoded_public_key));
++
++	/* Parsing should fail because the first coefficient is >= kPrime. */
++	if (MLKEM1024_parse_public_key(&pub, &cbs)) {
++		warnx("MLKEM1024_parse_public_key should have failed");
++		failed |= 1;
++	}
+ 
+ 	memcpy(encoded_public_key, first_two_bytes, sizeof(first_two_bytes));
+ 	CBS_init(&cbs, encoded_public_key, sizeof(encoded_public_key));
+-	TEST(!MLKEM1024_parse_public_key(pub, &cbs),
+-	    "MLKEM1024_parse_public_key");
+-	TEST(CBS_len(&cbs) != 0u, "CBS_len must be 0");
+-
+-	TEST(!encode_1024public_key(pub, &tmp_buf, &tmp_buf_len),
+-	    "encode_1024public_key");
+-	TEST(sizeof(encoded_public_key) != tmp_buf_len,
+-	    "encoded public key lengths differ");
+-	TEST_DATAEQ(tmp_buf, encoded_public_key, tmp_buf_len,
+-	    "encoded public keys");
++	if (!MLKEM1024_parse_public_key(&pub, &cbs)) {
++		warnx("MLKEM1024_parse_public_key");
++		failed |= 1;
++	}
++
++	if (CBS_len(&cbs) != 0u) {
++		warnx("CBS_len must be 0");
++		failed |= 1;
++	}
++
++	if (!mlkem1024_encode_public_key(&pub, &tmp_buf, &tmp_buf_len)) {
++		warnx("encode_public_key");
++		failed |= 1;
++	}
++	if (sizeof(encoded_public_key) != tmp_buf_len) {
++		warnx("mlkem1024 encoded public key lengths differ");
++		failed |= 1;
++	}
++
++	if (compare_data(encoded_public_key, tmp_buf, tmp_buf_len, 1024,
++	    "encoded public keys") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
+ 	free(tmp_buf);
+ 	tmp_buf = NULL;
+ 
+-	MALLOC(pub2, sizeof(struct MLKEM1024_public_key));
+-	MLKEM1024_public_from_private(pub2, priv);
+-	TEST(!encode_1024public_key(pub2, &tmp_buf, &tmp_buf_len),
+-	    "encode_public_key");
+-	TEST(sizeof(encoded_public_key) != tmp_buf_len,
+-	    "encoded public key lengths differ");
+-	TEST_DATAEQ(tmp_buf, encoded_public_key, tmp_buf_len,
+-	    "encoded pubic keys");
++	MLKEM1024_public_from_private(&pub2, &priv);
++	if (!mlkem1024_encode_public_key(&pub2, &tmp_buf, &tmp_buf_len)) {
++		warnx("mlkem1024_encode_public_key");
++		failed |= 1;
++	}
++	if (sizeof(encoded_public_key) != tmp_buf_len) {
++		warnx("mlkem1024 encoded public key lengths differ");
++		failed |= 1;
++	}
++
++	if (compare_data(encoded_public_key, tmp_buf, tmp_buf_len, 1024,
++	    "encoded public keys") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
+ 	free(tmp_buf);
+ 	tmp_buf = NULL;
+ 
+-	TEST(!encode_1024private_key(priv, &encoded_private_key,
+-	    &encoded_private_key_len), "encode_1024private_key");
++	if (!mlkem1024_encode_private_key(&priv, &encoded_private_key,
++	    &encoded_private_key_len)) {
++		warnx("mlkem1024_encode_private_key");
++		failed |= 1;
++	}
+ 
+ 	memcpy(first_two_bytes, encoded_private_key, sizeof(first_two_bytes));
+ 	memset(encoded_private_key, 0xff, sizeof(first_two_bytes));
+ 	CBS_init(&cbs, encoded_private_key, encoded_private_key_len);
+-	MALLOC(priv2, sizeof(struct MLKEM1024_private_key));
++
+ 	/*  Parsing should fail because the first coefficient is >= kPrime. */
+-	TEST(MLKEM1024_parse_private_key(priv2, &cbs), "Should not have parsed");
++	if (MLKEM1024_parse_private_key(&priv2, &cbs)) {
++		warnx("MLKEM1024_parse_private_key should have failed");
++		failed |= 1;
++	}
+ 
+ 	memcpy(encoded_private_key, first_two_bytes, sizeof(first_two_bytes));
+ 	CBS_init(&cbs, encoded_private_key, encoded_private_key_len);
+-	TEST(!MLKEM1024_parse_private_key(priv2, &cbs),
+-	    "MLKEM1024_parse_private_key");
+-	TEST(!encode_1024private_key(priv2, &tmp_buf, &tmp_buf_len),
+-	    "encode_private_key");
+-	TEST(encoded_private_key_len != tmp_buf_len,
+-	    "encoded private key lengths differ");
+-	TEST_DATAEQ(tmp_buf, encoded_private_key, encoded_private_key_len,
+-	    "encoded private keys");
++
++	if (!MLKEM1024_parse_private_key(&priv2, &cbs)) {
++		warnx("MLKEM1024_parse_private_key");
++		failed |= 1;
++	}
++
++	if (!mlkem1024_encode_private_key(&priv2, &tmp_buf, &tmp_buf_len)) {
++		warnx("mlkem1024_encode_private_key");
++		failed |= 1;
++	}
++
++	if (encoded_private_key_len != tmp_buf_len) {
++		warnx("mlkem1024 encode private key lengths differ");
++		failed |= 1;
++	}
++
++	if (compare_data(encoded_private_key, tmp_buf, tmp_buf_len, 1024,
++	    "encoded private key") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
++
+ 	free(tmp_buf);
+ 	tmp_buf = NULL;
+ 
+-	MLKEM1024_encap(ciphertext, shared_secret1, pub);
++	MLKEM1024_encap(ciphertext, shared_secret1, &pub);
+ 	MLKEM1024_decap(shared_secret2, ciphertext, MLKEM1024_CIPHERTEXT_BYTES,
+-	    priv);
+-	TEST_DATAEQ(shared_secret1, shared_secret2, MLKEM_SHARED_SECRET_BYTES,
+-	    "shared secrets with priv");
++	    &priv);
++	if (compare_data(shared_secret1, shared_secret2, MLKEM_SHARED_SECRET_BYTES,
++	    1024, "shared secrets with priv") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
++
+ 	MLKEM1024_decap(shared_secret2, ciphertext, MLKEM1024_CIPHERTEXT_BYTES,
+-	    priv2);
+-	TEST_DATAEQ(shared_secret1, shared_secret2, MLKEM_SHARED_SECRET_BYTES,
+-	    "shared secrets with priv2");
++	    &priv2);
++	if (compare_data(shared_secret1, shared_secret2, MLKEM_SHARED_SECRET_BYTES,
++	    1024, "shared secrets with priv2") != 0) {
++		warnx("compare_data");
++		failed |= 1;
++	}
+ 
+ 	free(encoded_private_key);
+-	free(pub);
+-	free(pub2);
+-	free(priv);
+-	free(priv2);
++
++	return failed;
+ }
+ 
+ int
+ main(int argc, char **argv)
+ {
+-	MlKem768UnitTest();
+-	MlKem1024UnitTest();
++	int failed = 0;
++
++	failed |= MlKem768UnitTest();
++	failed |= MlKem1024UnitTest();
+ 
+-	exit(failure);
++	return failed;
+ }
