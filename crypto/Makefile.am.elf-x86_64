@@ -1,5 +1,5 @@
-
-ASM_X86_64_ELF = aes/aes-elf-x86_64.S
+ASM_X86_64_ELF = aes/aes_amd64.c
+ASM_X86_64_ELF += aes/aes-elf-x86_64.S
 ASM_X86_64_ELF += aes/aesni-elf-x86_64.S
 ASM_X86_64_ELF += bn/modexp512-elf-x86_64.S
 ASM_X86_64_ELF += bn/mont-elf-x86_64.S

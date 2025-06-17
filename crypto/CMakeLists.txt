@@ -18,6 +18,7 @@ add_definitions(-DLIBRESSL_CRYPTO_INTERNAL)
 if(HOST_ASM_ELF_X86_64)
 	set(
 		ASM_X86_64_ELF_SRC
+		aes/aes_amd64.c
 		aes/aes-elf-x86_64.S
 		aes/aesni-elf-x86_64.S
 		bn/modexp512-elf-x86_64.S
@@ -53,6 +54,7 @@ endif()
 if(HOST_ASM_MACOSX_X86_64)
 	set(
 		ASM_X86_64_MACOSX_SRC
+		aes/aes_amd64.c
 		aes/aes-macosx-x86_64.S
 		aes/aesni-macosx-x86_64.S
 		bn/modexp512-macosx-x86_64.S
@@ -89,6 +91,7 @@ endif()
 if(HOST_ASM_MASM_X86_64)
 	set(
 		ASM_X86_64_MASM_SRC
+		aes/aes_amd64.c
 		aes/aes-masm-x86_64.S
 		aes/aesni-masm-x86_64.S
 		#bn/modexp512-masm-x86_64.S
@@ -113,6 +116,7 @@ endif()
 if(HOST_ASM_MINGW64_X86_64)
 	set(
 		ASM_X86_64_MINGW64_SRC
+		aes/aes_amd64.c
 		aes/aes-mingw64-x86_64.S
 		aes/aesni-mingw64-x86_64.S
 		#bn/modexp512-mingw64-x86_64.S
@@ -147,10 +151,8 @@ if(HOST_AARCH64)
 	endif()
 elseif(HOST_X86_64)
 	set(CRYPTO_SRC ${CRYPTO_SRC} arch/amd64/crypto_cpu_caps.c)
-	set(CRYPTO_SRC ${CRYPTO_SRC} aes/aes_amd64.c)
 elseif(HOST_I386)
 	set(CRYPTO_SRC ${CRYPTO_SRC} arch/i386/crypto_cpu_caps.c)
-	set(CRYPTO_SRC ${CRYPTO_SRC} aes/aes_i386.c)
 endif()
 
 set(
