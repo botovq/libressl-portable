@@ -54,6 +54,10 @@ EXTRA_DIST += CMakeLists.txt
 EXTRA_DIST += crypto.sym
 EXTRA_DIST += empty.c
 
+EXTRA_DIST += aes/aes_amd64.c
+EXTRA_DIST += aes/aes_i386.c
+EXTRA_DIST += bn/arch/amd64/bn_arch.c
+
 # needed for a CMake target
 EXTRA_DIST += compat/strcasecmp.c
 EXTRA_DIST += compat/getopt_long.c
@@ -239,11 +243,9 @@ endif
 
 if HOST_X86_64
 libcrypto_la_SOURCES += arch/amd64/crypto_cpu_caps.c
-libcrypto_la_SOURCES += aes/aes_amd64.c
 endif
 if HOST_I386
 libcrypto_la_SOURCES += arch/i386/crypto_cpu_caps.c
-libcrypto_la_SOURCES += aes/aes_i386.c
 endif
 
 libcrypto_la_SOURCES += crypto_err.c
