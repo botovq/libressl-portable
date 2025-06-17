@@ -91,7 +91,6 @@ endif()
 if(HOST_ASM_MASM_X86_64)
 	set(
 		ASM_X86_64_MASM_SRC
-		aes/aes_amd64.c
 		aes/aes-masm-x86_64.S
 		aes/aesni-masm-x86_64.S
 		#bn/modexp512-masm-x86_64.S
@@ -109,6 +108,7 @@ if(HOST_ASM_MASM_X86_64)
 	#add_definitions(-DOPENSSL_BN_ASM_MONT5)
 	add_definitions(-DGHASH_ASM)
 	add_definitions(-DRSA_ASM)
+	set(CRYPTO_SRC ${CRYPTO_SRC} aes/aes_amd64.c)
 	set(CRYPTO_SRC ${CRYPTO_SRC} ${ASM_X86_64_MASM_SRC})
 	set_property(SOURCE ${ASM_X86_64_MASM_SRC} PROPERTY LANGUAGE ASM_MASM)
 endif()
@@ -116,7 +116,6 @@ endif()
 if(HOST_ASM_MINGW64_X86_64)
 	set(
 		ASM_X86_64_MINGW64_SRC
-		aes/aes_amd64.c
 		aes/aes-mingw64-x86_64.S
 		aes/aesni-mingw64-x86_64.S
 		#bn/modexp512-mingw64-x86_64.S
@@ -134,6 +133,7 @@ if(HOST_ASM_MINGW64_X86_64)
 	#add_definitions(-DOPENSSL_BN_ASM_MONT5)
 	add_definitions(-DGHASH_ASM)
 	add_definitions(-DRSA_ASM)
+	set(CRYPTO_SRC ${CRYPTO_SRC} aes/aes_amd64.c)
 	set(CRYPTO_SRC ${CRYPTO_SRC} ${ASM_X86_64_MINGW64_SRC})
 endif()
 
